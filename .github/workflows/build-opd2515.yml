@@ -170,6 +170,11 @@ jobs:
             userspace/ksud/Cargo.toml
           sed -i 's#https://github.com/Kernel-SU/java-properties.git#https://github.com/KernelSU-Next/java-properties.git#g' \
             userspace/ksud/Cargo.toml
+          # The v3.3.0 tag also points at the retired Kernel-SU/ksu_props
+          # repository.  resetprop-rs is the public successor and retains the
+          # pinned 6f572310 crate revision used by that tag.
+          sed -i 's#https://github.com/Kernel-SU/ksu_props#https://github.com/5ec1cff/resetprop-rs#g' \
+            userspace/ksud/Cargo.toml
           rustup update stable
           rustup target add aarch64-linux-android
           source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
