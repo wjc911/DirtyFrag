@@ -26,7 +26,8 @@ jobs:
 
       - name: Fetch exact Android common kernel source
         run: |
-          git clone --filter=blob:none --no-checkout https://android.googlesource.com/kernel/common opd-kernel
+          git clone --filter=blob:none --no-checkout --single-branch --branch android16-6.12 \
+            https://android.googlesource.com/kernel/common opd-kernel
           git -C opd-kernel fetch --depth=1 origin "$OPD_KERNEL_COMMIT"
           git -C opd-kernel checkout --detach "$OPD_KERNEL_COMMIT"
           test "$(git -C opd-kernel rev-parse HEAD)" = "$OPD_KERNEL_COMMIT"
@@ -160,7 +161,15 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           KSU_PACKAGE_NAME: df.root
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: |
+          # KernelSU v3.3.0 still names a repository that was force-migrated
+          # after the tag.  The replacement is the same public crate and
+          # carries the pinned d97a9664 revision used by the release build.
+          sed -i 's#https://github.com/Kernel-SU/adb_client#https://github.com/cocool97/adb_client#g' \
+            userspace/ksud/Cargo.toml
+          sed -i 's#https://github.com/Kernel-SU/java-properties.git#https://github.com/KernelSU-Next/java-properties.git#g' \
+            userspace/ksud/Cargo.toml
           rustup update stable
           rustup target add aarch64-linux-android
           source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
