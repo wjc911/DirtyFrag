@@ -102,6 +102,35 @@ jobs:
           name: DirtyFrag-OPD2515-debug
           path: app/build/outputs/apk/debug/dirtyfrag.apk
 
+  # This path is intentionally independent of the custom ksud compile.  It
+  # produces a testable APK as soon as the exact OPD module is available,
+  # while the custom-package ksud job is still being diagnosed.  The bundled
+  # official manager binary may require a separate KernelSU manager package;
+  # this artifact is therefore a compatibility probe, not proof of one-APK
+  # operation.
+  build-opd-apk-bundled:
+    needs: build-opd-module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dfroot-opd2515-6.12
+          path: out
+      - name: Install exact module for the bundled APK build
+        run: cp out/dfroot-opd2515-6.12.ko app/src/main/jni/ko/dfroot-android16-6.12.ko
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK with the tracked KernelSU daemon
+        run: ./gradlew :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirtyFrag-OPD2515-bundled-ksud
+          path: app/build/outputs/apk/debug/dirtyfrag.apk
+
   build-ksud:
     runs-on: ubuntu-latest
     steps:
