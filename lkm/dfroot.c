@@ -49,6 +49,7 @@ static int __nocfi __init dfroot_init(void)
     static char *envp[] = { "PATH=/system/bin", NULL };
     static char *argv[] = { (char *)sh, "-c",
         "touch /dev/dfm0;"
+        " rmmod oplus_secure_guard_new 2>/dev/null;"      // OPD2515
         " rmmod oplus_secure_harden 2>/dev/null;"         //
         " rmmod oplus_security_keventupload 2>/dev/null;" // Oppo/OnePlus
         " rmmod oplus_security_guard 2>/dev/null",        //

@@ -363,10 +363,10 @@ public class MainActivity extends AppCompatActivity implements IReporter {
         // D2 vault status (Samsung VaultKeeper): Odin flashing allowed or
         // locked. Read-only; non-Samsung devices show "not available".
 
-        // SU Manager card: upstream 3.2 deleted the bundled assets/ksud, so the
-        // exploit stages libksud.so out of the chosen manager's
-        // nativeLibraryDir and refuses to run without one. Only apps that
-        // actually ship that library are offered.
+        // SU Manager card: this OPD2515 build carries the KernelSU userspace
+        // daemon in its own native library directory.  A separately installed
+        // manager remains supported, but the bundled daemon is selected by
+        // default so the one-APK flow does not require ADB or a second app.
         loadSuManagerPref();
         binding.rowSuManager.setOnClickListener(v -> {
             v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
@@ -803,12 +803,18 @@ public class MainActivity extends AppCompatActivity implements IReporter {
         List<SuManagerEntry> out = new ArrayList<>();
         PackageManager pm = getPackageManager();
         for (ApplicationInfo ai : pm.getInstalledApplications(0)) {
-            if (ai.packageName.equals(getPackageName())) continue;
             if (ai.nativeLibraryDir == null) continue;
             if (!new File(ai.nativeLibraryDir, "libksud.so").exists()) continue;
-            out.add(new SuManagerEntry(ai.packageName, pm.getApplicationLabel(ai)));
+            CharSequence label = ai.packageName.equals(getPackageName())
+                    ? "Built-in KernelSU daemon"
+                    : pm.getApplicationLabel(ai);
+            out.add(new SuManagerEntry(ai.packageName, label));
         }
-        out.sort((a, b) -> a.label.toString().compareToIgnoreCase(b.label.toString()));
+        out.sort((a, b) -> {
+            if (a.packageName.equals(getPackageName())) return -1;
+            if (b.packageName.equals(getPackageName())) return 1;
+            return a.label.toString().compareToIgnoreCase(b.label.toString());
+        });
         return out;
     }
 
@@ -828,6 +834,18 @@ public class MainActivity extends AppCompatActivity implements IReporter {
                 }
             }
             if (suManagerPkg == null) sp.edit().remove("su_manager").apply();
+        }
+        // Prefer the bundled daemon when no external manager was selected.
+        // This is deliberately based on the actual file, matching the same
+        // check used by ExploitRunner.stageAssets().
+        if (suManagerPkg == null) {
+            ApplicationInfo self = getApplicationInfo();
+            if (self.nativeLibraryDir != null &&
+                    new File(self.nativeLibraryDir, "libksud.so").isFile()) {
+                suManagerPkg = getPackageName();
+                suManagerLabel = "Built-in KernelSU daemon";
+                sp.edit().putString("su_manager", suManagerPkg).apply();
+            }
         }
         binding.suManagerSubtitle.setText(suManagerPkg == null
                 ? "Not selected - required"
@@ -1269,10 +1287,11 @@ public class MainActivity extends AppCompatActivity implements IReporter {
             int rc = ExploitRunner.run(mDeCtx, this);
             if (rc != 0) {
                 // 0 ok, 1 ksud/bootstrap error, 2 poll timeout or bad setup,
-                // 3 failed to patch files (see exp.c markers[]).
+                // 3 failed to patch files (see exp.c markers[]), 4 target gate.
                 String why = lastFailReason != null ? lastFailReason
                         : rc == 1 ? "ksud nonzero exit"
                         : rc == 2 ? "check logcat & dmesg"
+                        : rc == 4 ? "this APK is locked to OPD2515 kernel 6.12.58"
                         : "failed to patch files";
                 report("\n=== exploit failed: " + why + " ===\n");
             }
