@@ -45,9 +45,21 @@ jobs:
         run: |
           mkdir -p opd-out
           cp opd-inputs/.config opd-out/.config
+          # The GKI build stamps the build-specific release suffix into UTS_RELEASE.
+          # Preserve the downloaded ABI config, but reproduce that suffix for vermagic.
+          base_version=6.12.58
+          case "$OPD_KERNEL_RELEASE" in
+            "$base_version"*) local_suffix="${OPD_KERNEL_RELEASE#"$base_version"}" ;;
+            *) echo "Unexpected kernel release: $OPD_KERNEL_RELEASE"; exit 1 ;;
+          esac
+          sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$local_suffix\"|" opd-out/.config
+          sed -i 's/^CONFIG_LOCALVERSION_AUTO=.*/# CONFIG_LOCALVERSION_AUTO is not set/' opd-out/.config
+          export LOCALVERSION=""
           make -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" ARCH=arm64 LLVM=1 olddefconfig modules_prepare
           cp opd-inputs/vmlinux.symvers opd-out/Module.symvers
-          test "$(make -s -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" ARCH=arm64 LLVM=1 kernelrelease)" = "$OPD_KERNEL_RELEASE"
+          actual_release="$(LOCALVERSION="" make -s -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" ARCH=arm64 LLVM=1 kernelrelease)"
+          echo "Kernel release: $actual_release (expected $OPD_KERNEL_RELEASE)"
+          test "$actual_release" = "$OPD_KERNEL_RELEASE"
 
       - name: Build and verify exact OPD2515 dfroot module
         run: |
