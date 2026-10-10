@@ -1,5 +1,14 @@
 # DirtyFrag (CVE-2026-43284)
 
+> **OPD2515 experimental fork:** this branch is locked to OPPO Pad Mini
+> `OPD2515` running exactly
+> `6.12.58-android16-6-g7704a1ae279b-ab15213644-4k`.  Its CI rebuilds
+> `dfroot.ko` against the matching Android common kernel commit and packages a
+> KernelSU userspace daemon compiled with the app package name, so the APK can
+> be tested without ADB or a separately installed manager.  The kernel-module
+> artifact and the APK are still candidates until a real OPD2515 cold-boot run
+> proves UID 0, stable operation, and no anti-root reboot.
+
 DirtyFrag is a hardened fork of [diabl0w/DFRoot](https://github.com/diabl0w/DFRoot). It exploits
 CVE-2026-43284 (DirtyFrag), a kernel page cache write primitive, to load a kernel module without an
 unlocked bootloader and without a custom kernel. The fork targets Samsung phones (OneUI, RKP and KDP

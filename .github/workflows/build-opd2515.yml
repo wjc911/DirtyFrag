@@ -1,0 +1,188 @@
+name: Build OPD2515 exact candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opd2515]
+
+permissions:
+  contents: read
+
+env:
+  OPD_KERNEL_COMMIT: 7704a1ae279baec7789f6e19079cc4e80e62fa41
+  OPD_KERNEL_RELEASE: 6.12.58-android16-6-g7704a1ae279b-ab15213644-4k
+  OPD_BUILD_ID: 15213644
+
+jobs:
+  build-opd-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libelf-dev libssl-dev cpio rsync python3 clang llvm lld
+
+      - name: Fetch exact Android common kernel source
+        run: |
+          git clone --filter=blob:none --no-checkout --single-branch --branch android16-6.12 \
+            https://android.googlesource.com/kernel/common opd-kernel
+          git -C opd-kernel fetch --depth=1 origin "$OPD_KERNEL_COMMIT"
+          git -C opd-kernel checkout --detach "$OPD_KERNEL_COMMIT"
+          test "$(git -C opd-kernel rev-parse HEAD)" = "$OPD_KERNEL_COMMIT"
+
+      - name: Fetch exact OPD2515 GKI build inputs
+        run: |
+          mkdir -p opd-inputs
+          base="https://ci.android.com/builds/submitted/${OPD_BUILD_ID}/kernel_aarch64/latest/raw"
+          curl --fail --retry 5 --retry-delay 2 -L "$base/kernel_aarch64_dot_config" -o opd-inputs/.config
+          curl --fail --retry 5 --retry-delay 2 -L "$base/vmlinux.symvers" -o opd-inputs/vmlinux.symvers
+          grep -q 'Linux/arm64 6.12.58 Kernel Configuration' opd-inputs/.config
+          sha256sum opd-inputs/.config opd-inputs/vmlinux.symvers
+
+      - name: Prepare exact kernel tree
+        run: |
+          mkdir -p opd-out
+          cp opd-inputs/.config opd-out/.config
+          make -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" ARCH=arm64 LLVM=1 olddefconfig modules_prepare
+          cp opd-inputs/vmlinux.symvers opd-out/Module.symvers
+          test "$(make -s -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" ARCH=arm64 LLVM=1 kernelrelease)" = "$OPD_KERNEL_RELEASE"
+
+      - name: Build and verify exact OPD2515 dfroot module
+        run: |
+          make -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" M="$GITHUB_WORKSPACE/lkm" \
+            ARCH=arm64 LLVM=1 KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/opd-out/Module.symvers" modules
+          llvm-objcopy --strip-unneeded \
+            -R .comment -R .note.gnu.build-id -R .note.gnu.property \
+            -R .note.Linux -R .note.GNU-stack -R .BTF -R .BTF.base \
+            -R .llvm_addrsig -R .hyp.text -R .hyp.bss -R .hyp.rodata \
+            -R .hyp.event_ids -R .hyp.patchable_function_entries \
+            -R .hyp.data lkm/dfroot.ko
+          mkdir -p out
+          cp lkm/dfroot.ko out/dfroot-opd2515-6.12.ko
+          strings out/dfroot-opd2515-6.12.ko | tee out/dfroot-opd2515-strings.txt
+          grep -F "vermagic=$OPD_KERNEL_RELEASE" out/dfroot-opd2515-strings.txt
+          grep -F 'name=dfroot' out/dfroot-opd2515-strings.txt
+          sha256sum out/dfroot-opd2515-6.12.ko
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dfroot-opd2515-6.12
+          path: |
+            out/dfroot-opd2515-6.12.ko
+            out/dfroot-opd2515-strings.txt
+
+  build-opd-apk:
+    needs: [build-opd-module, build-ksud]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dfroot-opd2515-6.12
+          path: out
+      - uses: actions/download-artifact@v4
+        with:
+          name: ksud-opd2515
+          path: out/ksud
+      - name: Install exact module for the APK build
+        run: |
+          cp out/dfroot-opd2515-6.12.ko app/src/main/jni/ko/dfroot-android16-6.12.ko
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp out/ksud app/src/main/jniLibs/arm64-v8a/libksud.so
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirtyFrag-OPD2515-debug
+          path: app/build/outputs/apk/debug/dirtyfrag.apk
+
+  # This path is intentionally independent of the custom ksud compile.  It
+  # produces a testable APK as soon as the exact OPD module is available,
+  # while the custom-package ksud job is still being diagnosed.  The bundled
+  # official manager binary may require a separate KernelSU manager package;
+  # this artifact is therefore a compatibility probe, not proof of one-APK
+  # operation.
+  build-opd-apk-bundled:
+    needs: build-opd-module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dfroot-opd2515-6.12
+          path: out
+      - name: Install exact module for the bundled APK build
+        run: cp out/dfroot-opd2515-6.12.ko app/src/main/jni/ko/dfroot-android16-6.12.ko
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK with the tracked KernelSU daemon
+        run: ./gradlew :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirtyFrag-OPD2515-bundled-ksud
+          path: app/build/outputs/apk/debug/dirtyfrag.apk
+
+  build-ksud:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout KernelSU userspace
+        run: git clone --depth 1 --branch v3.3.0 https://github.com/tiann/KernelSU.git kernelsu
+      - name: Download KernelSU 6.12 LKM assets
+        run: |
+          mkdir -p kernelsu/userspace/ksud/bin/aarch64
+          curl --fail --retry 5 --retry-delay 2 -L \
+            https://github.com/tiann/KernelSU/releases/download/v3.3.0/lkm-aarch64-android16-6.12_kernelsu.ko \
+            -o kernelsu/userspace/ksud/bin/aarch64/android16-6.12_kernelsu.ko
+          curl --fail --retry 5 --retry-delay 2 -L \
+            https://github.com/tiann/KernelSU/releases/download/v3.3.0/ksuinit-aarch64 \
+            -o kernelsu/userspace/ksud/bin/aarch64/ksuinit
+          chmod 0755 kernelsu/userspace/ksud/bin/aarch64/ksuinit
+          sha256sum kernelsu/userspace/ksud/bin/aarch64/*
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+      - name: Build ksud for the DirtyFrag package
+        working-directory: kernelsu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          KSU_PACKAGE_NAME: df.root
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          # KernelSU v3.3.0 still names a repository that was force-migrated
+          # after the tag.  The replacement is the same public crate and
+          # carries the pinned d97a9664 revision used by the release build.
+          sed -i 's#https://github.com/Kernel-SU/adb_client#https://github.com/cocool97/adb_client#g' \
+            userspace/ksud/Cargo.toml
+          sed -i 's#https://github.com/Kernel-SU/java-properties.git#https://github.com/KernelSU-Next/java-properties.git#g' \
+            userspace/ksud/Cargo.toml
+          # The v3.3.0 tag also points at the retired Kernel-SU/ksu_props
+          # repository.  resetprop-rs is the public successor and retains the
+          # pinned 6f572310 crate revision used by that tag.
+          sed -i 's#https://github.com/Kernel-SU/ksu_props#https://github.com/5ec1cff/resetprop-rs#g' \
+            userspace/ksud/Cargo.toml
+          rustup update stable
+          rustup target add aarch64-linux-android
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target "$TRIPLE" --release --manifest-path ./userspace/ksud/Cargo.toml
+          cp "target/$TRIPLE/release/ksud" "$GITHUB_WORKSPACE/ksud"
+          chmod 0755 "$GITHUB_WORKSPACE/ksud"
+          file "$GITHUB_WORKSPACE/ksud"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksud-opd2515
+          path: ksud
