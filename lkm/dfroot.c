@@ -81,6 +81,17 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
     return 1;
 }
 
+/* Closed-loop self-test state: probe the kernel's own printk, then call it. */
+static struct df_audit df_selftest = { .name = "_printk" };
+
+static int df_selftest_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    (void)p;
+    (void)regs;
+    df_selftest.hits++;
+    return 0;
+}
+
 /* Report-only handler: counts entries but never touches regs.
  *
  * Counters are installed on EVERY target, not just the short-circuited ones.
@@ -282,6 +293,21 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
     int len = 0, hlen = 0;
     unsigned int i, hit = 0, shorted = 0, primary = 0;
 
+    /* Closed-loop self-test. _printk is exported and this function is about to
+     * call the kernel's own printk path many times, so if the probe mechanism
+     * works at all this counter must be non-zero. It separates "my probes do
+     * not fire" (mechanism/framework problem, no target selection can fix it)
+     * from "my probes fire but the guard does not call these functions". */
+    df_selftest.addr = (void *)get_addr("_printk");
+    if (df_selftest.addr) {
+        memset(&df_selftest.kp, 0, sizeof(df_selftest.kp));
+        df_selftest.kp.addr = (kprobe_opcode_t *)df_selftest.addr;
+        df_selftest.kp.pre_handler = df_selftest_pre_handler;
+        df_selftest.state = register_kprobe(&df_selftest.kp) < 0 ? -2 : 1;
+    } else {
+        df_selftest.state = -1;
+    }
+
     for (i = 0; i < DF_AUDIT_N; i++)
         if (df_audits[i].flags & DF_CLASS_PRIMARY)
             primary++;
@@ -345,6 +371,10 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
      * run the handler. */
     hlen += scnprintf(hits + hlen, sizeof(hits) - hlen,
                       "HITS total=%u", (unsigned int)DF_AUDIT_N);
+    /* The self-test counter goes first: it is the only number that says whether
+     * the probe framework invoked any handler in this module at all. */
+    hlen += scnprintf(hits + hlen, sizeof(hits) - hlen, " SELFTEST_%s=%u(st=%d)",
+                      df_selftest.name, df_selftest.hits, df_selftest.state);
     for (i = 0; i < DF_AUDIT_N; i++) {
         unsigned long missed = 0;
         void *np = (char *)&df_audits[i].kp + 32;
@@ -369,6 +399,10 @@ static void __exit df_audit_stop(void)
 {
     unsigned int i;
 
+    if (df_selftest.state == 1) {
+        unregister_kprobe(&df_selftest.kp);
+        df_selftest.state = 0;
+    }
     for (i = 0; i < DF_AUDIT_N; i++) {
         struct df_audit *a = &df_audits[i];
 
