@@ -59,11 +59,8 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * and module-local symbols are in kallsyms.
  *
  * Enforce mode (the default) then short-circuits only the DF_CLASS_PRIMARY
- * targets: the UID post-handler whose body continues into an inlined
- * send_sig(9) + kevent report, and report_security_event, which is the shared
- * egress the execve/heapspray paths call directly.  Targets marked
- * DF_CLASS_UNSAFE stay observe-only because skipping their body mutates
- * arguments or state (e.g. kevent_send_to_user consumes an sk_buff).
+ * targets; the remaining targets are registered so a run still reports whether
+ * they are present and probeable, but their function bodies are left alone.
  *
  * Why probes are registered by resolved *address* rather than by
  * .symbol_name: several guard functions are STB_LOCAL, and registering by
@@ -79,12 +76,25 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
 #define DF_CLASS_DECIDE 0x01  /* root-check decision / report path        */
 #define DF_CLASS_EGRESS 0x02  /* kernel -> userspace event egress         */
 #define DF_CLASS_EXPORT 0x04  /* exported, but no caller inside the guard */
-#define DF_CLASS_UNSAFE 0x08  /* skipping the body is semantically unsafe */
-/* Short-circuit only this target when enforce mode is on. Device audit showed
- * all targets are probeable, so the set is chosen on risk, not availability:
- * these two are stateless and their whole purpose is the kill/report we want to
- * suppress. The UNSAFE ones (sk_buff consumer, stateful bookkeeping) stay
- * observe-only until each is proven separately. */
+/* Short-circuit only the DF_CLASS_PRIMARY targets when enforce mode is on.
+ *
+ * Device evidence (OPD2515, audit build, logcat 22:38:35) fixed the target set:
+ *   OPLUS_KEVENT_RECORD event_type=3
+ *   payload:10051,path@@/data/app/.../lib/arm64/libdfroot.so
+ * i.e. the alert that actually fires is driven by the /data execve path check
+ * on our own native library, not by the app-UID root transition. So the primary
+ * set spans both paths plus the single netlink egress:
+ *   oplus_root_check_post_handler - UID path; its body continues into an
+ *                                   inlined send_sig(9) and the kevent report
+ *   report_security_event         - shared report primitive on the execve path
+ *   oplus_secure_harden_kevent    - the report site observed firing above
+ *   oplus_exe_block_ret_handler   - execve-path decision wrapper
+ *   kevent_send_to_user           - netlink egress; skips the skb send itself
+ *                                   (consumes the sk_buff, hence no re-entry risk
+ *                                   from a return-value rewrite)
+ * Two targets stay observe-only because their return semantics must not be
+ * rewritten: oplus_heapspray_check and the is_unlocked getter.
+ */
 #define DF_CLASS_PRIMARY 0x10
 
 struct df_audit {
@@ -102,12 +112,12 @@ static struct df_audit df_audits[] = {
     { "oplus_root_check_succ",           DF_CLASS_DECIDE },
     { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
     { "oplus_root_killed",               DF_CLASS_DECIDE | DF_CLASS_EXPORT },
-    { "oplus_exe_block_ret_handler",     DF_CLASS_DECIDE | DF_CLASS_UNSAFE },
+    { "oplus_exe_block_ret_handler",     DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "oplus_report_execveat",           DF_CLASS_DECIDE },
     { "oplus_report_execveat_new",       DF_CLASS_DECIDE },
-    { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE },
+    { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "report_security_event",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_UNSAFE },
+    { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_PRIMARY },
 };
 #define DF_AUDIT_N ARRAY_SIZE(df_audits)
 
@@ -208,8 +218,7 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
 
         memset(&a->kp, 0, sizeof(a->kp));
         a->kp.addr = (kprobe_opcode_t *)a->addr;
-        if (df_hook_enforce && !(a->flags & DF_CLASS_UNSAFE) &&
-            (a->flags & DF_CLASS_PRIMARY)) {
+        if (df_hook_enforce && (a->flags & DF_CLASS_PRIMARY)) {
             a->kp.pre_handler = null_pre_handler;
             shorted++;
         }
