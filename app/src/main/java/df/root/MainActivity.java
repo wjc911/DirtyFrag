@@ -1276,6 +1276,22 @@ public class MainActivity extends AppCompatActivity implements IReporter {
         }
     }
 
+    /** bootstrap.c writes this when it refuses to late-load KernelSU because the
+     *  anti-root probes are not fully armed. Surfacing it turns an opaque
+     *  "exploit failed" into an actionable message. */
+    private String readAntiRootGate() {
+        File f = new File(mDeCtx.getFilesDir(), "dfroot-gate.txt");
+        if (!f.exists()) return null;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f)))) {
+            String line = r.readLine();
+            return line == null ? null : line.trim();
+        } catch (Exception e) {
+            Log.w(TAG, "read dfroot-gate.txt failed", e);
+            return null;
+        }
+    }
+
     private void runExploit() {
         // bootstrap.c reads soft_reboot straight out of the DE prefs, so mirror
         // the Autorun card's choice into the key it reads right before launch.
@@ -1288,7 +1304,9 @@ public class MainActivity extends AppCompatActivity implements IReporter {
             if (rc != 0) {
                 // 0 ok, 1 ksud/bootstrap error, 2 poll timeout or bad setup,
                 // 3 failed to patch files (see exp.c markers[]), 4 target gate.
-                String why = lastFailReason != null ? lastFailReason
+                String gate = readAntiRootGate();
+                String why = gate != null ? gate
+                        : lastFailReason != null ? lastFailReason
                         : rc == 1 ? "ksud nonzero exit"
                         : rc == 2 ? "check logcat & dmesg"
                         : rc == 4 ? "this APK is locked to OPD2515 kernel 6.12.58"

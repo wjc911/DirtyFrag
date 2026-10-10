@@ -57,6 +57,10 @@ static int read_prefs(char *su_manager, size_t su_manager_size, int *soft_reboot
     return 0;
 }
 
+/* Set when late_load_allowed() approves an enforce-mode run: the module must
+ * then stay loaded, because the short-circuit probes live in it. */
+static int late_load_resident;
+
 /* Read the anti-root probe report. Returns bytes read, or -1 if unavailable. */
 static int read_audit(char *out, size_t out_size)
 {
@@ -122,6 +126,10 @@ static int late_load_allowed(const char **reason)
             return 0;
         }
         *reason = "enforce build, all targets armed";
+        /* Report resident module: the short-circuit probes live in dfroot.ko and
+         * must stay registered for as long as the root session exists, so the
+         * caller must not unload the module after a successful late-load. */
+        late_load_resident = 1;
         return 1;
     }
 
@@ -274,6 +282,7 @@ int main(void)
     touch("/dev/dfm1");
     char su_manager[256];
     int soft_reboot, disable_mods;
+    const char *gate_reason = NULL;
     if (read_prefs(su_manager, sizeof(su_manager), &soft_reboot, &disable_mods) != 0) {
         touch("/dev/dfme0");
         return 1;
@@ -298,10 +307,11 @@ int main(void)
     /* Anti-root gate (see late_load_allowed). Refuse to establish root when the
      * probes are audit-only or only partially armed, so a run cannot produce the
      * root-plus-alert combination the project is trying to eliminate. */
-    const char *gate_reason = NULL;
     if (!late_load_allowed(&gate_reason)) {
         touch("/dev/dfmg0");
-        FILE *lg = fopen("/data/local/tmp/dfroot-gate.txt", "w");
+        /* Device-protected app dir: readable by the app UID, unlike
+         * /data/local/tmp (shell_data_file) or /dev (0600, root). */
+        FILE *lg = fopen("/data/user_de/0/df.root/files/dfroot-gate.txt", "w");
         if (lg) {
             fprintf(lg, "late-load refused: %s\n", gate_reason);
             fclose(lg);
@@ -321,6 +331,8 @@ int main(void)
         touch("/dev/dfme2");
     }
 
-    run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
+    /* Keep the module resident when its probes are what suppresses the alert. */
+    if (!late_load_resident)
+        run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
     return 0;
 }

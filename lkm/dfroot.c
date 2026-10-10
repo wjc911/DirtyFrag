@@ -106,12 +106,30 @@ static int df_audit_ok;
 static filp_open_t     df_filp_open;
 static kernel_write_t  df_kernel_write;
 
-/* Never skip the body from a probe handler until the mechanism is proven on
- * this kernel: the guard functions carry paciasp/autiasp prologues and the
- * skip-body idiom returns to a link register that has not been re-signed. */
+/* Audit by default. The module is loaded by writing it into the page cache, so
+ * there is no way to pass a module parameter at load time; the enforce opt-in is
+ * therefore file based: create /data/local/tmp/dfroot-enforce before a run. The
+ * audit line reports which mode was actually active, and bootstrap.c refuses to
+ * late-load KernelSU unless the mode it sees is "enforce". */
 static int df_hook_enforce;
 module_param_named(enforce, df_hook_enforce, int, 0444);
 MODULE_PARM_DESC(enforce, "0 = audit/hook targets but never skip a body (default)");
+
+#define DF_ENFORCE_FLAG "/data/local/tmp/dfroot-enforce"
+
+static void df_enforce_probe(void)
+{
+    struct file *f;
+
+    if (df_hook_enforce || !df_filp_open)
+        return;
+    f = df_filp_open(DF_ENFORCE_FLAG, O_RDONLY, 0);
+    if (IS_ERR(f))
+        return;
+    filp_close(f, NULL);
+    df_hook_enforce = 1;
+    pr_info("dfroot: enforce mode requested by %s\n", DF_ENFORCE_FLAG);
+}
 
 static void df_audit_write(const char *msg)
 {
@@ -240,6 +258,7 @@ static int __nocfi __init dfroot_init(void)
     // Resolve the file helpers used to publish the anti-root probe report.
     df_filp_open    = (filp_open_t)   get_addr("filp_open");
     df_kernel_write = (kernel_write_t)get_addr("kernel_write");
+    df_enforce_probe();
 
     // Invalidate page_cache for crash_dump64
     // NOTE: this can cause issues if a process is currently executing
