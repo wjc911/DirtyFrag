@@ -24,6 +24,11 @@ typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *)
  * through kallsyms and called indirectly rather than linked against. */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 
+/* Forward declaration: the short-circuit handler below has to find its own
+ * table entry by address, and the table is defined with the rest of the audit
+ * state further down. */
+static struct df_audit df_audits[];
+
 static struct kprobe defex_enforce_kp;
 static struct kprobe defex_umh_kp;
 static int defex_enforce_ok;
@@ -35,6 +40,24 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
     regs->regs[0] = 0;         /* x0 = DEFEX_ALLOW */
     regs->pc = regs->regs[30]; /* skip body: return to caller */
     return 1;
+}
+
+/* Same skip-body semantics, but it records that the target was actually
+ * reached. Without this the module cannot distinguish "the guard function is
+ * not on the path that raises the alert" from "the probe never fired", and the
+ * two have completely different fixes. The handler may run from probe context,
+ * so it does nothing but a per-CPU-free increment. */
+static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    unsigned int i;
+
+    for (i = 0; i < DF_AUDIT_N; i++) {
+        if (df_audits[i].addr == (void *)p->addr) {
+            df_audits[i].hits++;
+            break;
+        }
+    }
+    return null_pre_handler(p, regs);
 }
 
 /*
@@ -92,8 +115,8 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
  *   kevent_send_to_user           - netlink egress; skips the skb send itself
  *                                   (consumes the sk_buff, hence no re-entry risk
  *                                   from a return-value rewrite)
- * Two targets stay observe-only because their return semantics must not be
- * rewritten: oplus_heapspray_check and the is_unlocked getter.
+ * The remaining six targets stay observe-only so a run still reports whether
+ * they are present and probeable.
  */
 #define DF_CLASS_PRIMARY 0x10
 
@@ -103,11 +126,11 @@ struct df_audit {
     struct kprobe kp;
     void *addr;
     int state;               /* 0 = untried, 1 = armed, -1 = missing, -2 = refused */
+    unsigned int hits;       /* how many times the short-circuit handler ran */
 };
 
 static struct df_audit df_audits[] = {
-    /* name                              flags                                   */
-    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    /* name                              flags                                   */    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "oplus_root_check_pre_handler",    DF_CLASS_DECIDE },
     { "oplus_root_check_succ",           DF_CLASS_DECIDE },
     { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
@@ -219,7 +242,7 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
         memset(&a->kp, 0, sizeof(a->kp));
         a->kp.addr = (kprobe_opcode_t *)a->addr;
         if (df_hook_enforce && (a->flags & DF_CLASS_PRIMARY)) {
-            a->kp.pre_handler = null_pre_handler;
+            a->kp.pre_handler = df_short_pre_handler;
             shorted++;
         }
 
@@ -251,6 +274,18 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
     len += scnprintf(line + len, sizeof(line) - len,
                      " total=%u/%u shorted=%u/%u\n",
                      hit, (unsigned int)DF_AUDIT_N, shorted, primary);
+
+    /* Second line: how many times each short-circuit actually ran. A primary
+     * target with hits=0 is not on the alert path, however plausible it looked
+     * statically. */
+    len += scnprintf(line + len, sizeof(line) - len, "HITS");
+    for (i = 0; i < DF_AUDIT_N; i++) {
+        if (!(df_audits[i].flags & DF_CLASS_PRIMARY))
+            continue;
+        len += scnprintf(line + len, sizeof(line) - len, " %s=%u",
+                         df_audits[i].name, df_audits[i].hits);
+    }
+    len += scnprintf(line + len, sizeof(line) - len, "\n");
 
     df_audit_write(line);
     pr_info("dfroot: audit %s", line);
