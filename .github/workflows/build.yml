@@ -54,6 +54,28 @@ jobs:
           name: df-lkm-${{ matrix.kmi }}
           path: out/dfroot-${{ matrix.kmi }}.ko
 
+  build-tracked-debug:
+    name: Tracked OPD2515 debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: opd2515-test
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Create ephemeral signing key
+        run: keytool -genkeypair -v -keystore app/keystore.jks -storepass dirtyfrag -keypass dirtyfrag -alias dirtyfrag -dname 'CN=DirtyFrag' -keyalg RSA -keysize 2048 -validity 3650 -noprompt
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK from tracked exact module and bundled ksud
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirtyFrag-OPD2515-tracked-bundled
+          path: app/build/outputs/apk/debug/dirtyfrag.apk
   build-dfroot:
     needs: build-lkms
     runs-on: ubuntu-latest
@@ -61,7 +83,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Validate signing config
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
         run: |
           if [ "${{ secrets.KEYSTORE }}" = "" ]; then
             echo "::error::Signing secrets not configured. KEYSTORE secret is required for release builds."
@@ -69,7 +91,7 @@ jobs:
           fi
 
       - name: Create keystore
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
         run: |
           # app/build.gradle.kts signs with app/keystore.jks (gitignored; the README
           # documents how to generate it), so the KEYSTORE secret has to be decoded
@@ -91,9 +113,13 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
+      - name: Create ephemeral signing key for manual test
+        if: github.event_name == 'workflow_dispatch'
+        run: keytool -genkeypair -v -keystore app/keystore.jks -storepass dirtyfrag -keypass dirtyfrag -alias dirtyfrag -dname 'CN=DirtyFrag' -keyalg RSA -keysize 2048 -validity 3650 -noprompt
+
       - name: Build DFRoot APK
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ./gradlew :app:assembleDebug
           else
             ./gradlew :app:assembleRelease
