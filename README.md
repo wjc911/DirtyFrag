@@ -1,13 +1,11 @@
 # DirtyFrag (CVE-2026-43284)
 
-> **OPD2515 experimental fork:** this branch is locked to OPPO Pad Mini
-> `OPD2515` running exactly
-> `6.12.58-android16-6-g7704a1ae279b-ab15213644-4k`.  Its CI rebuilds
-> `dfroot.ko` against the matching Android common kernel commit and packages a
-> KernelSU userspace daemon compiled with the app package name, so the APK can
-> be tested without ADB or a separately installed manager.  The kernel-module
-> artifact and the APK are still candidates until a real OPD2515 cold-boot run
-> proves UID 0, stable operation, and no anti-root reboot.
+> **OPD2515 build:** this account fork targets OPPO Pad Mini `OPD2515` running exactly
+> `6.12.58-android16-6-g7704a1ae279b-ab15213644-4k`. CI rebuilds `dfroot.ko`
+> against the matching Android common kernel commit and packages the matching
+> KernelSU userspace daemon into the APK. One on-device cold-boot test confirmed
+> root returned after restart without ADB. This result is device/kernel-specific;
+> revalidate after any system update.
 
 DirtyFrag is a hardened fork of [diabl0w/DFRoot](https://github.com/diabl0w/DFRoot). It exploits
 CVE-2026-43284 (DirtyFrag), a kernel page cache write primitive, to load a kernel module without an
@@ -21,7 +19,7 @@ hardening) and keeps upstream's SU-manager agnostic design.
 
 ## Install
 
-1. Install the DirtyFrag APK from [Releases](https://github.com/mitschud/DirtyFrag/releases/latest).
+1. Install the DirtyFrag APK from [Releases](https://github.com/wjc911/DirtyFrag_oppo_pad_mini/releases/latest).
 2. Install an SU manager that **ships `libksud.so`**:
    - Samsung - **required**:
      - [diabl0w's KernelSU for Samsung, samsung-v1.0](https://github.com/diabl0w/KernelSU/releases/tag/samsung-v1.0) -
