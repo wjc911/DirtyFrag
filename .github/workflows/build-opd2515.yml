@@ -96,7 +96,8 @@ jobs:
           name: dfroot-opd2515-6.12
           path: |
             out/dfroot-opd2515-6.12.ko
-            out/dfroot-opd2515-strings.txt`n            out/dfroot-symbol-audit.txt
+            out/dfroot-opd2515-strings.txt
+            out/dfroot-symbol-audit.txt
 
   build-opd-apk:
     needs: [build-opd-module, build-ksud]
