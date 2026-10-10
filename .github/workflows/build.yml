@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: opd2515-test
+          ref: main
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
