@@ -61,17 +61,49 @@ static int read_prefs(char *su_manager, size_t su_manager_size, int *soft_reboot
  * then stay loaded, because the short-circuit probes live in it. */
 static int late_load_resident;
 
-/* Read the anti-root probe report. Returns bytes read, or -1 if unavailable. */
+/* Read the anti-root probe report. Returns bytes read, or -1 if unavailable.
+ *
+ * dfroot.ko writes the report with two kernel_write calls (the ARMED line and
+ * the HITS line) before it spawns this helper, but nothing serialises the two
+ * against each other: an observed run produced a report whose first line was
+ * cut off mid-way ("ed=7/7"), i.e. this helper read the file while the module
+ * was still appending. A torn report makes the gate see a malformed mode and
+ * refuse a run that was actually fine.
+ *
+ * So read, then re-read, and only accept the buffer once two consecutive reads
+ * are byte-identical and end in a newline. That converges on the first reading
+ * the module is no longer writing. */
 static int read_audit(char *out, size_t out_size)
 {
-    int fd = open(AUDIT_PATH, O_RDONLY);
-    if (fd < 0) return -1;
+    static char prev[4096];
+    size_t prev_len = 0;
+    int attempt;
 
-    int n = read(fd, out, out_size - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    out[n] = '\0';
-    return n;
+    for (attempt = 0; attempt < 20; attempt++) {
+        int fd = open(AUDIT_PATH, O_RDONLY);
+        int n, whole;
+
+        if (fd < 0) {
+            usleep(50000);
+            continue;
+        }
+        n = read(fd, out, out_size - 1);
+        close(fd);
+        if (n <= 0) {
+            usleep(50000);
+            continue;
+        }
+        out[n] = '\0';
+        whole = (out[n - 1] == '\n');
+
+        if (whole && prev_len == (size_t)n && !memcmp(prev, out, (size_t)n))
+            return n;
+
+        memcpy(prev, out, (size_t)n);
+        prev_len = (size_t)n;
+        usleep(50000);
+    }
+    return (prev_len > 0) ? (int)prev_len : -1;
 }
 
 /* Count occurrences of the two-byte suffix "=M" (target present and probed). */

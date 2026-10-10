@@ -84,6 +84,63 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
 /* Closed-loop self-test state: probe the kernel's own printk, then call it. */
 static struct df_audit df_selftest = { .name = "_printk" };
 
+/* Stack capture for the decisive experiment.
+ *
+ * The self-test proved the probe framework calls back into this module
+ * (SELFTEST__printk=12), yet all eleven guard targets stayed at zero hits. So
+ * the open question is no longer "does kprobe work" but "what code actually runs
+ * when the alert fires". A probe on send_sig / netlink_unicast / __alloc_skb
+ * fires when the guard emits its event, and the call stack at that moment names
+ * the reporter directly instead of us inferring it from string cross-references.
+ *
+ * Recorded per probe: hit count plus the first captured stack, symbolised
+ * lazily at report time so the handler itself stays minimal. */
+#define DF_STACK_DEPTH 16
+#define DF_STACK_SLOTS 4   /* send_sig, netlink_unicast, __alloc_skb, genlmsg_put */
+
+struct df_stackcap {
+    const char *name;
+    struct kprobe kp;
+    void *addr;
+    int state;
+    unsigned int hits;
+    unsigned int nr;
+    unsigned long stack[DF_STACK_DEPTH];
+};
+
+static struct df_stackcap df_caps[DF_STACK_SLOTS] = {
+    { .name = "send_sig" },
+    { .name = "netlink_unicast" },
+    { .name = "__alloc_skb" },
+    { .name = "genlmsg_put" },
+};
+#define DF_CAP_N ARRAY_SIZE(df_caps)
+
+static stack_trace_save_t df_stack_save;
+
+static int df_cap_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct df_stackcap *c = NULL;
+    unsigned int i;
+
+    (void)regs;
+    for (i = 0; i < DF_CAP_N; i++) {
+        if (df_caps[i].addr == (void *)p->addr) {
+            c = &df_caps[i];
+            break;
+        }
+    }
+    if (!c)
+        return 0;
+
+    c->hits++;
+    /* Capture once: enough to identify the caller, and this runs in probe
+     * context so it must not do more work than necessary. */
+    if (c->nr == 0 && df_stack_save)
+        c->nr = df_stack_save(c->stack, DF_STACK_DEPTH, 1);
+    return 0;
+}
+
 static int df_selftest_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     (void)p;
@@ -308,6 +365,22 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
         df_selftest.state = -1;
     }
 
+    /* Symbolise stacks at report time; stack_trace_save is what lets us name the
+     * caller that actually emitted the event. */
+    df_stack_save = (stack_trace_save_t)get_addr("stack_trace_save");
+
+    for (i = 0; i < DF_CAP_N; i++) {
+        df_caps[i].addr = (void *)get_addr(df_caps[i].name);
+        if (!df_caps[i].addr) {
+            df_caps[i].state = -1;
+            continue;
+        }
+        memset(&df_caps[i].kp, 0, sizeof(df_caps[i].kp));
+        df_caps[i].kp.addr = (kprobe_opcode_t *)df_caps[i].addr;
+        df_caps[i].kp.pre_handler = df_cap_pre_handler;
+        df_caps[i].state = register_kprobe(&df_caps[i].kp) < 0 ? -2 : 1;
+    }
+
     for (i = 0; i < DF_AUDIT_N; i++)
         if (df_audits[i].flags & DF_CLASS_PRIMARY)
             primary++;
@@ -385,9 +458,31 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
                           df_audits[i].name, df_audits[i].hits, missed);
     }
     hlen += scnprintf(hits + hlen, sizeof(hits) - hlen, "\n");
-
     df_audit_write(line);
     df_audit_write(hits);
+
+    /* Third line: the decisive trace. For each capture probe, its hit count and
+     * the raw kernel addresses of the stack at the moment it fired, so the
+     * reporter can be identified offline against /proc/kallsyms. */
+    {
+        static char cap[3072];
+        int clen = 0;
+
+        clen += scnprintf(cap + clen, sizeof(cap) - clen, "TRACE");
+        for (i = 0; i < DF_CAP_N; i++) {
+            unsigned int k;
+
+            clen += scnprintf(cap + clen, sizeof(cap) - clen,
+                              " %s(st=%d,hits=%u)", df_caps[i].name,
+                              df_caps[i].state, df_caps[i].hits);
+            for (k = 0; k < df_caps[i].nr && clen < (int)sizeof(cap) - 32; k++)
+                clen += scnprintf(cap + clen, sizeof(cap) - clen, " %#lx",
+                                  df_caps[i].stack[k]);
+        }
+        clen += scnprintf(cap + clen, sizeof(cap) - clen, "\n");
+        df_audit_write(cap);
+        pr_info("dfroot: %s", cap);
+    }
     pr_info("dfroot: audit %s", line);
     pr_info("dfroot: %s", hits);
 
@@ -402,6 +497,12 @@ static void __exit df_audit_stop(void)
     if (df_selftest.state == 1) {
         unregister_kprobe(&df_selftest.kp);
         df_selftest.state = 0;
+    }
+    for (i = 0; i < DF_CAP_N; i++) {
+        if (df_caps[i].state == 1) {
+            unregister_kprobe(&df_caps[i].kp);
+            df_caps[i].state = 0;
+        }
     }
     for (i = 0; i < DF_AUDIT_N; i++) {
         struct df_audit *a = &df_audits[i];
