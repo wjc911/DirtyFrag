@@ -19,6 +19,10 @@ typedef int (*umh_exec_t)(void *info, int wait);
 typedef int  (*kern_path_t)(const char *, unsigned int, struct path *);
 typedef int  (*invalidate_t)(struct address_space *);
 typedef void (*path_put_t)(const struct path *);
+typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
+/* filp_open is not EXPORT_SYMBOL'd on this GKI kernel, so it must be resolved
+ * through kallsyms and called indirectly rather than linked against. */
+typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 
 static struct kprobe defex_enforce_kp;
 static struct kprobe defex_umh_kp;
@@ -97,6 +101,11 @@ static struct df_audit df_audits[] = {
 
 static int df_audit_ok;
 
+/* Resolved at runtime: neither is safe to link against (filp_open is not
+ * exported; kernel_write is, but resolving both keeps one code path). */
+static filp_open_t     df_filp_open;
+static kernel_write_t  df_kernel_write;
+
 /* Never skip the body from a probe handler until the mechanism is proven on
  * this kernel: the guard functions carry paciasp/autiasp prologues and the
  * skip-body idiom returns to a link register that has not been re-signed. */
@@ -109,12 +118,18 @@ static void df_audit_write(const char *msg)
     struct file *f;
     loff_t pos = 0;
 
-    f = filp_open("/dev/dfm0", O_WRONLY | O_CREAT, 0600);
+    if (!df_filp_open || !df_kernel_write) {
+        pr_warn("dfroot: audit write unavailable (open=%px write=%px)\n",
+                df_filp_open, df_kernel_write);
+        return;
+    }
+
+    f = df_filp_open("/dev/dfm0", O_WRONLY | O_CREAT, 0600);
     if (IS_ERR(f)) {
         pr_warn("dfroot: audit write: /dev/dfm0 open failed (%ld)\n", PTR_ERR(f));
         return;
     }
-    kernel_write(f, msg, strlen(msg), &pos);
+    df_kernel_write(f, msg, strlen(msg), &pos);
     filp_close(f, NULL);
 }
 
@@ -221,6 +236,10 @@ static int __nocfi __init dfroot_init(void)
     }
     get_addr = (kallsyms_lookup_name_t)kln_kp.addr;
     unregister_kprobe(&kln_kp);
+
+    // Resolve the file helpers used to publish the anti-root probe report.
+    df_filp_open    = (filp_open_t)   get_addr("filp_open");
+    df_kernel_write = (kernel_write_t)get_addr("kernel_write");
 
     // Invalidate page_cache for crash_dump64
     // NOTE: this can cause issues if a process is currently executing

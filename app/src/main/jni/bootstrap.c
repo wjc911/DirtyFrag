@@ -13,6 +13,10 @@
 #define KSUD       "/data/adb/ksud"
 #define PREFS_PATH "/data/user_de/0/df.root/shared_prefs/dfroot.xml"
 #define MODULES_DIR "/data/adb/modules"
+/* Anti-root probe report, written by dfroot.ko during module_init, i.e. before
+ * this helper is exec'd. Format:
+ *   ARMED mode=<audit|enforce> <sym>=<M|N|R> ... total=<hit>/<n> */
+#define AUDIT_PATH "/dev/dfm0"
 
 static int pref_true(const char *buf, const char *key)
 {
@@ -50,6 +54,78 @@ static int read_prefs(char *su_manager, size_t su_manager_size, int *soft_reboot
     *soft_reboot = pref_true(buf, "soft_reboot");
     *disable_modules = pref_true(buf, "disable_modules");
 
+    return 0;
+}
+
+/* Read the anti-root probe report. Returns bytes read, or -1 if unavailable. */
+static int read_audit(char *out, size_t out_size)
+{
+    int fd = open(AUDIT_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+
+    int n = read(fd, out, out_size - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    out[n] = '\0';
+    return n;
+}
+
+/* Count occurrences of the two-byte suffix "=M" (target present and probed). */
+static int count_armed(const char *buf)
+{
+    int n = 0;
+    for (const char *p = buf; (p = strstr(p, "=M")) != NULL; p += 2)
+        n++;
+    return n;
+}
+
+/* Decide whether KernelSU may be late-loaded.
+ *
+ * In the default "audit" mode the module only *reports* which guard symbols it
+ * could hook; nothing is short-circuited, so a run that proceeds would still
+ * raise the OPPO anti-root alert. Refuse to late-load in that case: an
+ * audit-only run must produce evidence, not a root+alert combination.
+ *
+ * In "enforce" mode require every reported target to be armed, so a partially
+ * hooked run fails closed instead of half-suppressing the alert.
+ *
+ * Returns 1 to proceed, 0 to refuse. *reason is set for logging. */
+static int late_load_allowed(const char **reason)
+{
+    static char buf[2048];
+    int n = read_audit(buf, sizeof(buf));
+
+    if (n < 0) {
+        *reason = "no anti-root probe report";
+        return 0;
+    }
+
+    char *mode = strstr(buf, "mode=");
+    if (!mode) {
+        *reason = "malformed anti-root probe report";
+        return 0;
+    }
+
+    int total = 0, hit = 0;
+    char *tp = strstr(buf, "total=");
+    if (tp)
+        sscanf(tp + 6, "%d/%d", &hit, &total);
+
+    if (!strncmp(mode + 5, "audit", 5)) {
+        *reason = "audit-only build: probes observed, nothing suppressed";
+        return 0;
+    }
+
+    if (!strncmp(mode + 5, "enforce", 7)) {
+        if (total <= 0 || count_armed(buf) != total || hit != total) {
+            *reason = "enforce build but not every target armed";
+            return 0;
+        }
+        *reason = "enforce build, all targets armed";
+        return 1;
+    }
+
+    *reason = "unknown anti-root probe mode";
     return 0;
 }
 
@@ -217,6 +293,21 @@ int main(void)
             touch("/dev/dfme1");
             return 1;
         }
+    }
+
+    /* Anti-root gate (see late_load_allowed). Refuse to establish root when the
+     * probes are audit-only or only partially armed, so a run cannot produce the
+     * root-plus-alert combination the project is trying to eliminate. */
+    const char *gate_reason = NULL;
+    if (!late_load_allowed(&gate_reason)) {
+        touch("/dev/dfmg0");
+        FILE *lg = fopen("/data/local/tmp/dfroot-gate.txt", "w");
+        if (lg) {
+            fprintf(lg, "late-load refused: %s\n", gate_reason);
+            fclose(lg);
+        }
+        run_ctx(NULL, (char *[]){ "/system/bin/rmmod", "dfroot", NULL });
+        return 1;
     }
 
     touch("/dev/dfm5");
