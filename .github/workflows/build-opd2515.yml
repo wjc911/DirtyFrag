@@ -63,8 +63,21 @@ jobs:
 
       - name: Build and verify exact OPD2515 dfroot module
         run: |
+          # Android 16 GKI's raw CI artifact omits this generated list. dfroot only
+          # imports vmlinux exports, which the audit below verifies explicitly.
+          : > opd-kernel/protected_module_names_list
           LOCALVERSION="" make -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" M="$GITHUB_WORKSPACE/lkm" \
             ARCH=arm64 LLVM=1 KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/opd-out/Module.symvers" modules
+          export LC_ALL=C
+          llvm-nm -u lkm/dfroot.ko | awk '$1 == "U" {print $2}' | sort -u > out/dfroot-undefined-symbols.txt
+          cut -f2 opd-out/Module.symvers | sort -u > out/vmlinux-exported-symbols.txt
+          comm -23 out/dfroot-undefined-symbols.txt out/vmlinux-exported-symbols.txt > out/dfroot-unresolved-symbols.txt
+          if [ -s out/dfroot-unresolved-symbols.txt ]; then
+            echo "dfroot imports symbols absent from the exact vmlinux.symvers:"
+            cat out/dfroot-unresolved-symbols.txt
+            exit 1
+          fi
+          echo "All dfroot undefined references are provided by the exact vmlinux.symvers." > out/dfroot-symbol-audit.txt
           llvm-objcopy --strip-unneeded \
             -R .comment -R .note.gnu.build-id -R .note.gnu.property \
             -R .note.Linux -R .note.GNU-stack -R .BTF -R .BTF.base \
@@ -83,7 +96,7 @@ jobs:
           name: dfroot-opd2515-6.12
           path: |
             out/dfroot-opd2515-6.12.ko
-            out/dfroot-opd2515-strings.txt
+            out/dfroot-opd2515-strings.txt`n            out/dfroot-symbol-audit.txt
 
   build-opd-apk:
     needs: [build-opd-module, build-ksud]
