@@ -50,8 +50,8 @@ static struct df_audit df_audits[] = {
     { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
     { "oplus_root_killed",               DF_CLASS_DECIDE | DF_CLASS_EXPORT },
     { "oplus_exe_block_ret_handler",     DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "oplus_report_execveat",           DF_CLASS_DECIDE },
-    { "oplus_report_execveat_new",       DF_CLASS_DECIDE },
+    { "oplus_report_execveat",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    { "oplus_report_execveat_new",       DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "report_security_event",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_PRIMARY },
@@ -166,16 +166,21 @@ static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * logcat 22:38:35) fixed it:
  *   OPLUS_KEVENT_RECORD event_type=3
  *   payload:10051,path@@/data/app/.../lib/arm64/libdfroot.so
- * i.e. the alert that actually fires is driven by the /data execve path check
- * on our own native library, not by the app-UID root transition. So the primary
- * set spans both paths plus the single netlink egress:
+ * That payload format string is '%d,path@@%s', and the only function in the
+ * guard that references it is oplus_report_execveat -- which is why the first
+ * enforce attempt still raised the alert: that reporter was observe-only while
+ * report_security_event (a different payload format, '$$uid@@%d$$EVENT_TYPE@@%d')
+ * was already short-circuited. The primary set is therefore every reporter that
+ * can reach the userspace netlink family, plus the UID path and the egress:
  *   oplus_root_check_post_handler - UID path; dispatches into
  *                                   oplus_root_check_succ -> oplus_root_killed
  *   oplus_exe_block_ret_handler   - execve-path wrapper
+ *   oplus_report_execveat         - emits '%d,path@@%s' (the observed alert)
+ *   oplus_report_execveat_new     - same reporter, alternate entry
  *   oplus_secure_harden_kevent    - a direct async reporter
  *   report_security_event         - shared report primitive (11 call sites)
  *   kevent_send_to_user           - the single netlink egress
- * The remaining six targets stay observe-only.
+ * The remaining four targets stay observe-only.
  */
 
 
