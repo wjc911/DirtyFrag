@@ -320,6 +320,15 @@ static void df_enforce_probe(void)
     }
 }
 
+/* Write the whole report in one shot.
+ *
+ * This used to be called once per line, each time opening /dev/dfm0 with a
+ * fresh loff_t pos = 0. Every call therefore wrote from offset 0 and clobbered
+ * the previous line's head, which is exactly the corruption the device showed:
+ *   TRACE ...
+ *   oplus_root_check_succ=0/0 ...     <- ARMED line's prefix destroyed
+ * A torn report then made bootstrap.c reject the run as "malformed", so the
+ * gate never let KernelSU load. Single open, single write, O_TRUNC. */
 static void df_audit_write(const char *msg)
 {
     struct file *f;
@@ -334,7 +343,7 @@ static void df_audit_write(const char *msg)
     /* 0666: the report is a non-sensitive diagnostic that has to be readable by
      * the debuggable app (via run-as) and by an adb shell, neither of which runs
      * as root. bootstrap.c also copies it into the app's own data dir. */
-    f = df_filp_open("/dev/dfm0", O_WRONLY | O_CREAT, 0666);
+    f = df_filp_open("/dev/dfm0", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (IS_ERR(f)) {
         pr_warn("dfroot: audit write: /dev/dfm0 open failed (%ld)\n", PTR_ERR(f));
         return;
@@ -458,8 +467,6 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
                           df_audits[i].name, df_audits[i].hits, missed);
     }
     hlen += scnprintf(hits + hlen, sizeof(hits) - hlen, "\n");
-    df_audit_write(line);
-    df_audit_write(hits);
 
     /* Third line: the decisive trace. For each capture probe, its hit count and
      * the raw kernel addresses of the stack at the moment it fired, so the
@@ -480,7 +487,19 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
                                   df_caps[i].stack[k]);
         }
         clen += scnprintf(cap + clen, sizeof(cap) - clen, "\n");
-        df_audit_write(cap);
+
+        /* One report, one write: three separate writes corrupted each other. */
+        {
+            static char whole[5120];
+            int wlen = 0;
+
+            wlen += scnprintf(whole + wlen, sizeof(whole) - wlen, "%s", line);
+            wlen += scnprintf(whole + wlen, sizeof(whole) - wlen, "%s", hits);
+            wlen += scnprintf(whole + wlen, sizeof(whole) - wlen, "%s", cap);
+            df_audit_write(whole);
+        }
+        pr_info("dfroot: audit %s", line);
+        pr_info("dfroot: %s", hits);
         pr_info("dfroot: %s", cap);
     }
     pr_info("dfroot: audit %s", line);
