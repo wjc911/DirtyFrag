@@ -23,6 +23,16 @@ typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *)
 /* filp_open is not EXPORT_SYMBOL'd on this GKI kernel, so it must be resolved
  * through kallsyms and called indirectly rather than linked against. */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
+/* Minimal layout of the front of struct kprobe (kernel 6.12):
+ *   struct hlist_node hlist;   +0
+ *   struct list_head list;     +16
+ *   unsigned long nmissed;     +32
+ *   kprobe_opcode_t *addr;     +40
+ * Reading nmissed and addr out of our own kprobe is how the module reports
+ * whether the kernel ever entered the probe (or could not) instead of
+ * inferring it. */
+typedef unsigned int (*stack_trace_save_t)(unsigned long *store, unsigned int size,
+                                           unsigned int skipnr);
 
 /* Audit target classification. Defined before the table so the initialisers can
  * use them. */
@@ -39,7 +49,7 @@ struct df_audit {
     struct kprobe kp;
     void *addr;
     int state;               /* 0 = untried, 1 = armed, -1 = missing, -2 = refused */
-    unsigned int hits;       /* how many times the short-circuit handler ran */
+    unsigned int hits;       /* entries into this probe's handler */
 };
 
 static struct df_audit df_audits[] = {
@@ -71,21 +81,31 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
     return 1;
 }
 
-/* Same skip-body semantics, but it records that the target was actually
- * reached. Without this the module cannot distinguish "the guard function is
- * not on the path that raises the alert" from "the probe never fired", and the
- * two have completely different fixes. The handler may run from probe context,
- * so it does nothing but an increment. */
-static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
+/* Report-only handler: counts entries but never touches regs.
+ *
+ * Counters are installed on EVERY target, not just the short-circuited ones.
+ * The first version counted only the primary set, so "all counters zero" could
+ * not distinguish "these functions are not on the alert path" from "no probe in
+ * this module ever fires". Counting everything makes the two unambiguous, and
+ * the handler runs in probe context so it does nothing but an increment. */
+static int df_count_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int i;
 
+    (void)regs;
     for (i = 0; i < DF_AUDIT_N; i++) {
         if (df_audits[i].addr == (void *)p->addr) {
             df_audits[i].hits++;
             break;
         }
     }
+    return 0;
+}
+
+/* Same, and additionally skips the function body. */
+static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    df_count_pre_handler(p, regs);
     return null_pre_handler(p, regs);
 }
 
@@ -257,8 +277,9 @@ static void df_audit_write(const char *msg)
 
 static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
 {
-    char line[1024];
-    int len = 0;
+    static char line[1024];
+    static char hits[1024];
+    int len = 0, hlen = 0;
     unsigned int i, hit = 0, shorted = 0, primary = 0;
 
     for (i = 0; i < DF_AUDIT_N; i++)
@@ -284,6 +305,8 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
         if (df_hook_enforce && (a->flags & DF_CLASS_PRIMARY)) {
             a->kp.pre_handler = df_short_pre_handler;
             shorted++;
+        } else {
+            a->kp.pre_handler = df_count_pre_handler;
         }
 
         rc = register_kprobe(&a->kp);
@@ -315,20 +338,28 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
                      " total=%u/%u shorted=%u/%u\n",
                      hit, (unsigned int)DF_AUDIT_N, shorted, primary);
 
-    /* Second line: how many times each short-circuit actually ran. A primary
-     * target with hits=0 is not on the alert path, however plausible it looked
-     * statically. */
-    len += scnprintf(line + len, sizeof(line) - len, "HITS");
+    /* Second line: entries into each probe's handler, for every target, plus the
+     * kernel's own nmissed counter read reflectively out of our struct kprobe
+     * (unsigned long at +32 on this kernel). A target with hits=0 is simply not
+     * on the alert path; nmissed>0 means the kernel hit the probe but could not
+     * run the handler. */
+    hlen += scnprintf(hits + hlen, sizeof(hits) - hlen,
+                      "HITS total=%u", (unsigned int)DF_AUDIT_N);
     for (i = 0; i < DF_AUDIT_N; i++) {
-        if (!(df_audits[i].flags & DF_CLASS_PRIMARY))
-            continue;
-        len += scnprintf(line + len, sizeof(line) - len, " %s=%u",
-                         df_audits[i].name, df_audits[i].hits);
+        unsigned long missed = 0;
+        void *np = (char *)&df_audits[i].kp + 32;
+
+        if (df_audits[i].state == 1)
+            memcpy(&missed, np, sizeof(missed));
+        hlen += scnprintf(hits + hlen, sizeof(hits) - hlen, " %s=%u/%lu",
+                          df_audits[i].name, df_audits[i].hits, missed);
     }
-    len += scnprintf(line + len, sizeof(line) - len, "\n");
+    hlen += scnprintf(hits + hlen, sizeof(hits) - hlen, "\n");
 
     df_audit_write(line);
+    df_audit_write(hits);
     pr_info("dfroot: audit %s", line);
+    pr_info("dfroot: %s", hits);
 
     df_audit_ok = hit > 0;
     return df_audit_ok ? 0 : -ENOENT;

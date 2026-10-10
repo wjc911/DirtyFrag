@@ -156,7 +156,7 @@ static int late_load_allowed(const char **reason)
  * one place that stays readable afterwards (adb run-as df.root, and the app). */
 static void publish_audit(void)
 {
-    static char buf[2048];
+    static char buf[4096];
     int n = read_audit(buf, sizeof(buf));
 
     if (n < 0)
@@ -165,7 +165,7 @@ static void publish_audit(void)
     FILE *f = fopen("/data/user_de/0/df.root/files/dfroot-audit.txt", "w");
     if (!f)
         return;
-    fputs(buf, f);
+    fwrite(buf, 1, (size_t)n, f);
     fclose(f);
 }
 
