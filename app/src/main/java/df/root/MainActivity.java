@@ -1292,6 +1292,22 @@ public class MainActivity extends AppCompatActivity implements IReporter {
         }
     }
 
+    /** bootstrap.c copies dfroot.ko's anti-root probe report here (it runs as
+     *  root, the app cannot read /dev/dfm0). Surfacing it is what makes the
+     *  probe audit observable on a device that has no su binary. */
+    private String readAntiRootAudit() {
+        File f = new File(mDeCtx.getFilesDir(), "dfroot-audit.txt");
+        if (!f.exists()) return null;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f)))) {
+            String line = r.readLine();
+            return line == null ? null : line.trim();
+        } catch (Exception e) {
+            Log.w(TAG, "read dfroot-audit.txt failed", e);
+            return null;
+        }
+    }
+
     private void runExploit() {
         // bootstrap.c reads soft_reboot straight out of the DE prefs, so mirror
         // the Autorun card's choice into the key it reads right before launch.
@@ -1315,6 +1331,10 @@ public class MainActivity extends AppCompatActivity implements IReporter {
             }
             mDeCtx.getSharedPreferences("dfroot", MODE_PRIVATE)
                     .edit().putBoolean("last_run_success", rc == 0).apply();
+            String audit = readAntiRootAudit();
+            if (audit != null) {
+                report("\n=== anti-root probe report ===\n" + audit + "\n");
+            }
         } catch (Exception e) {
             Log.e(TAG, "exploit exception", e);
             report("\nexception: " + e + "\n");

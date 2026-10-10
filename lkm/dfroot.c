@@ -142,7 +142,10 @@ static void df_audit_write(const char *msg)
         return;
     }
 
-    f = df_filp_open("/dev/dfm0", O_WRONLY | O_CREAT, 0600);
+    /* 0666: the report is a non-sensitive diagnostic that has to be readable by
+     * the debuggable app (via run-as) and by an adb shell, neither of which runs
+     * as root. bootstrap.c also copies it into the app's own data dir. */
+    f = df_filp_open("/dev/dfm0", O_WRONLY | O_CREAT, 0666);
     if (IS_ERR(f)) {
         pr_warn("dfroot: audit write: /dev/dfm0 open failed (%ld)\n", PTR_ERR(f));
         return;

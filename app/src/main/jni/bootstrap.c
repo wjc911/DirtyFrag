@@ -85,13 +85,16 @@ static int count_armed(const char *buf)
 
 /* Decide whether KernelSU may be late-loaded.
  *
- * In the default "audit" mode the module only *reports* which guard symbols it
- * could hook; nothing is short-circuited, so a run that proceeds would still
- * raise the OPPO anti-root alert. Refuse to late-load in that case: an
- * audit-only run must produce evidence, not a root+alert combination.
+ * The module's default "audit" mode only *reports* which guard symbols it could
+ * hook; nothing is short-circuited, so an audit run does not suppress the OPPO
+ * alert and must NOT be treated as the finished fix. It is still allowed to
+ * establish root, because the only practical way to collect the probe report on
+ * this device is to be root (there is no su binary, and /dev/dfm0 is not
+ * readable by an unprivileged uid).
  *
- * In "enforce" mode require every reported target to be armed, so a partially
- * hooked run fails closed instead of half-suppressing the alert.
+ * "enforce" is the shippable mode and fails closed: unless every reported target
+ * is armed, late-load is refused, so a partially hooked run cannot produce the
+ * root-plus-alert combination.
  *
  * Returns 1 to proceed, 0 to refuse. *reason is set for logging. */
 static int late_load_allowed(const char **reason)
@@ -116,8 +119,8 @@ static int late_load_allowed(const char **reason)
         sscanf(tp + 6, "%d/%d", &hit, &total);
 
     if (!strncmp(mode + 5, "audit", 5)) {
-        *reason = "audit-only build: probes observed, nothing suppressed";
-        return 0;
+        *reason = "audit build: evidence run, alert suppression NOT active";
+        return 1;
     }
 
     if (!strncmp(mode + 5, "enforce", 7)) {
@@ -135,6 +138,26 @@ static int late_load_allowed(const char **reason)
 
     *reason = "unknown anti-root probe mode";
     return 0;
+}
+
+/* Publish the probe report where it can actually be retrieved. This helper runs
+ * as root (from the LKM's usermode helper), but the report otherwise lives only
+ * in /dev/dfm0, which an unprivileged uid cannot read and which disappears when
+ * the module is unloaded. Copy it into the app's device-protected files dir, the
+ * one place that stays readable afterwards (adb run-as df.root, and the app). */
+static void publish_audit(void)
+{
+    static char buf[2048];
+    int n = read_audit(buf, sizeof(buf));
+
+    if (n < 0)
+        return;
+
+    FILE *f = fopen("/data/user_de/0/df.root/files/dfroot-audit.txt", "w");
+    if (!f)
+        return;
+    fputs(buf, f);
+    fclose(f);
 }
 
 static int adopt_zygote_env(void)
@@ -291,6 +314,10 @@ int main(void)
     touch("/dev/dfm2");
     if (adopt_zygote_env())
         touch("/dev/dfmw0");
+
+    /* Publish the probe report before anything else, so it survives even if a
+     * later stage fails or the gate refuses to late-load. */
+    publish_audit();
 
     touch("/dev/dfm3");
     if (set_partitions_ro())
