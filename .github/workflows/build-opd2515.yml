@@ -22,7 +22,7 @@ jobs:
       - name: Install kernel build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libelf-dev libssl-dev cpio rsync python3 clang llvm lld
+          sudo apt-get install -y bc bison flex libelf-dev libdwarf-dev libssl-dev cpio rsync python3 clang llvm lld
 
       - name: Fetch exact Android common kernel source
         run: |
@@ -175,6 +175,10 @@ jobs:
           # pinned 6f572310 crate revision used by that tag.
           sed -i 's#https://github.com/Kernel-SU/ksu_props#https://github.com/5ec1cff/resetprop-rs#g' \
             userspace/ksud/Cargo.toml
+          # Kernel-SU's rustix fork is no longer fetchable at its pinned commit;
+          # use the compatible crates.io 1.x release for this Android build.
+          sed -i 's#rustix = { git = "https://github.com/Kernel-SU/rustix.git", rev = "4a53fbc",#rustix = { version = "1",#' \
+            userspace/ksuinit/Cargo.toml
           rustup update stable
           rustup target add aarch64-linux-android
           source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
