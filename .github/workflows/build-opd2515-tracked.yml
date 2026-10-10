@@ -1,7 +1,7 @@
 name: Build tracked OPD2515 test APK
 
-on:
-  workflow_dispatch:
+'on':
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -18,8 +18,7 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Create ephemeral signing key
-        run: |
-          keytool -genkeypair -v -keystore app/keystore.jks -storepass dirtyfrag -keypass dirtyfrag -alias dirtyfrag -dname 'CN=DirtyFrag' -keyalg RSA -keysize 2048 -validity 3650 -noprompt
+        run: keytool -genkeypair -v -keystore app/keystore.jks -storepass dirtyfrag -keypass dirtyfrag -alias dirtyfrag -dname 'CN=DirtyFrag' -keyalg RSA -keysize 2048 -validity 3650 -noprompt
       - uses: gradle/actions/setup-gradle@v4
       - name: Build debug APK from tracked exact module and bundled ksud
         run: |
