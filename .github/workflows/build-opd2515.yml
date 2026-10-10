@@ -68,6 +68,7 @@ jobs:
           : > opd-kernel/protected_module_names_list
           LOCALVERSION="" make -C opd-kernel O="$GITHUB_WORKSPACE/opd-out" M="$GITHUB_WORKSPACE/lkm" \
             ARCH=arm64 LLVM=1 KBUILD_EXTRA_SYMBOLS="$GITHUB_WORKSPACE/opd-out/Module.symvers" modules
+          mkdir -p out
           export LC_ALL=C
           llvm-nm -u lkm/dfroot.ko | awk '$1 == "U" {print $2}' | sort -u > out/dfroot-undefined-symbols.txt
           cut -f2 opd-out/Module.symvers | sort -u > out/vmlinux-exported-symbols.txt
