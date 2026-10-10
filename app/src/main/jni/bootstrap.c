@@ -113,10 +113,13 @@ static int late_load_allowed(const char **reason)
         return 0;
     }
 
-    int total = 0, hit = 0;
+    int total = 0, hit = 0, shorted = 0, primary = 0;
     char *tp = strstr(buf, "total=");
     if (tp)
         sscanf(tp + 6, "%d/%d", &hit, &total);
+    char *sp = strstr(buf, "shorted=");
+    if (sp)
+        sscanf(sp + 8, "%d/%d", &shorted, &primary);
 
     if (!strncmp(mode + 5, "audit", 5)) {
         *reason = "audit build: evidence run, alert suppression NOT active";
@@ -128,7 +131,13 @@ static int late_load_allowed(const char **reason)
             *reason = "enforce build but not every target armed";
             return 0;
         }
-        *reason = "enforce build, all targets armed";
+        /* The short-circuit set is what actually suppresses the alert, so an
+         * enforce run with an un-shorted primary target must not proceed. */
+        if (primary <= 0 || shorted != primary) {
+            *reason = "enforce build but the primary targets are not short-circuited";
+            return 0;
+        }
+        *reason = "enforce build, all targets armed and primaries short-circuited";
         /* Report resident module: the short-circuit probes live in dfroot.ko and
          * must stay registered for as long as the root session exists, so the
          * caller must not unload the module after a successful late-load. */

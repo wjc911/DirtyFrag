@@ -52,12 +52,18 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * initialised before this module gets to run, and the helper's own
  * root->nobody credential change is itself something the guard watches.
  *
- * What this revision does instead is *observe only*: it resolves the guard's
- * decision/report functions by name and tries to register a kprobe on each so
- * that the very first device run reports, as hard facts, which guard symbols
- * exist on this kernel and which are probeable.  Nothing is short-circuited
- * and no guard function is altered unless DF_HOOK_ENFORCE is set, so a run of
- * this build cannot change system behaviour -- it can only produce evidence.
+ * What this revision does instead is resolve the guard's decision/report
+ * functions by name and register a kprobe on each.  A device audit run on
+ * OPD2515 proved all eleven of them resolve and register (11/11 M), including
+ * the STB_LOCAL ones, because Android 16 GKI is built with CONFIG_KALLSYMS_ALL
+ * and module-local symbols are in kallsyms.
+ *
+ * Enforce mode (the default) then short-circuits only the DF_CLASS_PRIMARY
+ * targets: the UID post-handler whose body continues into an inlined
+ * send_sig(9) + kevent report, and report_security_event, which is the shared
+ * egress the execve/heapspray paths call directly.  Targets marked
+ * DF_CLASS_UNSAFE stay observe-only because skipping their body mutates
+ * arguments or state (e.g. kevent_send_to_user consumes an sk_buff).
  *
  * Why probes are registered by resolved *address* rather than by
  * .symbol_name: several guard functions are STB_LOCAL, and registering by
@@ -74,6 +80,12 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
 #define DF_CLASS_EGRESS 0x02  /* kernel -> userspace event egress         */
 #define DF_CLASS_EXPORT 0x04  /* exported, but no caller inside the guard */
 #define DF_CLASS_UNSAFE 0x08  /* skipping the body is semantically unsafe */
+/* Short-circuit only this target when enforce mode is on. Device audit showed
+ * all targets are probeable, so the set is chosen on risk, not availability:
+ * these two are stateless and their whole purpose is the kill/report we want to
+ * suppress. The UNSAFE ones (sk_buff consumer, stateful bookkeeping) stay
+ * observe-only until each is proven separately. */
+#define DF_CLASS_PRIMARY 0x10
 
 struct df_audit {
     const char *name;
@@ -85,7 +97,7 @@ struct df_audit {
 
 static struct df_audit df_audits[] = {
     /* name                              flags                                   */
-    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE },
+    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "oplus_root_check_pre_handler",    DF_CLASS_DECIDE },
     { "oplus_root_check_succ",           DF_CLASS_DECIDE },
     { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
@@ -94,7 +106,7 @@ static struct df_audit df_audits[] = {
     { "oplus_report_execveat",           DF_CLASS_DECIDE },
     { "oplus_report_execveat_new",       DF_CLASS_DECIDE },
     { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE },
-    { "report_security_event",           DF_CLASS_DECIDE },
+    { "report_security_event",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
     { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_UNSAFE },
 };
 #define DF_AUDIT_N ARRAY_SIZE(df_audits)
@@ -106,29 +118,45 @@ static int df_audit_ok;
 static filp_open_t     df_filp_open;
 static kernel_write_t  df_kernel_write;
 
-/* Audit by default. The module is loaded by writing it into the page cache, so
- * there is no way to pass a module parameter at load time; the enforce opt-in is
- * therefore file based: create /data/local/tmp/dfroot-enforce before a run. The
- * audit line reports which mode was actually active, and bootstrap.c refuses to
- * late-load KernelSU unless the mode it sees is "enforce". */
-static int df_hook_enforce;
+/* Enforce by default: the short-circuit probes are the product, and the
+ * userspace gate fails closed if any of them is not armed. There is no way to
+ * pass a module parameter when the module is loaded through the page-cache
+ * write primitive, so the escape hatches are file based:
+ *   create /data/local/tmp/dfroot-enforce   -> force enforce on
+ *   create /data/local/tmp/dfroot-audit-only -> force audit (never skip a body)
+ * audit-only exists so an evidence run can be taken without touching any guard
+ * function body. */
+static int df_hook_enforce = 1;
 module_param_named(enforce, df_hook_enforce, int, 0444);
-MODULE_PARM_DESC(enforce, "0 = audit/hook targets but never skip a body (default)");
+MODULE_PARM_DESC(enforce, "1 = short-circuit the primary guard targets (default)");
 
 #define DF_ENFORCE_FLAG "/data/local/tmp/dfroot-enforce"
+#define DF_AUDIT_FLAG   "/data/local/tmp/dfroot-audit-only"
 
-static void df_enforce_probe(void)
+static int df_file_exists(const char *path)
 {
     struct file *f;
 
-    if (df_hook_enforce || !df_filp_open)
-        return;
-    f = df_filp_open(DF_ENFORCE_FLAG, O_RDONLY, 0);
+    if (!df_filp_open)
+        return 0;
+    f = df_filp_open(path, O_RDONLY, 0);
     if (IS_ERR(f))
-        return;
+        return 0;
     filp_close(f, NULL);
-    df_hook_enforce = 1;
-    pr_info("dfroot: enforce mode requested by %s\n", DF_ENFORCE_FLAG);
+    return 1;
+}
+
+static void df_enforce_probe(void)
+{
+    if (df_file_exists(DF_AUDIT_FLAG)) {
+        df_hook_enforce = 0;
+        pr_info("dfroot: audit-only requested by %s\n", DF_AUDIT_FLAG);
+        return;
+    }
+    if (!df_hook_enforce && df_file_exists(DF_ENFORCE_FLAG)) {
+        df_hook_enforce = 1;
+        pr_info("dfroot: enforce mode requested by %s\n", DF_ENFORCE_FLAG);
+    }
 }
 
 static void df_audit_write(const char *msg)
@@ -158,7 +186,11 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
 {
     char line[1024];
     int len = 0;
-    unsigned int i, hit = 0;
+    unsigned int i, hit = 0, shorted = 0, primary = 0;
+
+    for (i = 0; i < DF_AUDIT_N; i++)
+        if (df_audits[i].flags & DF_CLASS_PRIMARY)
+            primary++;
 
     len += scnprintf(line + len, sizeof(line) - len,
                      "ARMED mode=%s", df_hook_enforce ? "enforce" : "audit");
@@ -176,8 +208,11 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
 
         memset(&a->kp, 0, sizeof(a->kp));
         a->kp.addr = (kprobe_opcode_t *)a->addr;
-        if (df_hook_enforce && !(a->flags & DF_CLASS_UNSAFE))
+        if (df_hook_enforce && !(a->flags & DF_CLASS_UNSAFE) &&
+            (a->flags & DF_CLASS_PRIMARY)) {
             a->kp.pre_handler = null_pre_handler;
+            shorted++;
+        }
 
         rc = register_kprobe(&a->kp);
         if (rc < 0) {
@@ -204,8 +239,9 @@ static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
         default: len += scnprintf(line + len, sizeof(line) - len, "?"); break;
         }
     }
-    len += scnprintf(line + len, sizeof(line) - len, " total=%u/%u\n",
-                     hit, (unsigned int)DF_AUDIT_N);
+    len += scnprintf(line + len, sizeof(line) - len,
+                     " total=%u/%u shorted=%u/%u\n",
+                     hit, (unsigned int)DF_AUDIT_N, shorted, primary);
 
     df_audit_write(line);
     pr_info("dfroot: audit %s", line);
