@@ -36,7 +36,21 @@ public class BootReceiver extends BroadcastReceiver implements IReporter {
             Log.i(TAG, "boot: already hooked, skipping");
             return;
         }
-        Log.i(TAG, "boot: " + intent.getAction());
+        String action = intent.getAction();
+        // OPPO sends LOCKED_BOOT_COMPLETED while the device-encrypted
+        // environment is still coming up.  DirtyFrag's IpSec/netd setup is
+        // not reliable at that point: an early attempt fails and the safety
+        // interlock disables this receiver before the real BOOT_COMPLETED
+        // broadcast arrives.  Defer to the normal post-boot broadcast.
+        if (Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)) {
+            Log.i(TAG, "boot: locked phase; deferring to BOOT_COMPLETED");
+            return;
+        }
+        if (!Intent.ACTION_BOOT_COMPLETED.equals(action)) {
+            Log.i(TAG, "boot: ignoring unexpected action=" + action);
+            return;
+        }
+        Log.i(TAG, "boot: " + action);
         final Context deCtx = context.createDeviceProtectedStorageContext();
         boolean expert = deCtx.getSharedPreferences("dfroot", Context.MODE_PRIVATE)
                 .getBoolean("expert_mode", false);
