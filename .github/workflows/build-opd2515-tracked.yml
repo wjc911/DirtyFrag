@@ -1,0 +1,31 @@
+name: Build tracked OPD2515 test APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: opd2515-test
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Create ephemeral signing key
+        run: |
+          keytool -genkeypair -v -keystore app/keystore.jks -storepass dirtyfrag -keypass dirtyfrag -alias dirtyfrag -dname 'CN=DirtyFrag' -keyalg RSA -keysize 2048 -validity 3650 -noprompt
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK from tracked exact module and bundled ksud
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirtyFrag-OPD2515-tracked-bundled
+          path: app/build/outputs/apk/debug/dirtyfrag.apk
