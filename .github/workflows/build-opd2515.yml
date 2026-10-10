@@ -3,7 +3,7 @@ name: Build OPD2515 exact candidate
 on:
   workflow_dispatch:
   push:
-    branches: [opd2515]
+    branches: [main]
 
 permissions:
   contents: read
