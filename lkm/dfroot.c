@@ -24,10 +24,39 @@ typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *)
  * through kallsyms and called indirectly rather than linked against. */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 
-/* Forward declaration: the short-circuit handler below has to find its own
- * table entry by address, and the table is defined with the rest of the audit
- * state further down. */
-static struct df_audit df_audits[];
+/* Audit target classification. Defined before the table so the initialisers can
+ * use them. */
+#define DF_CLASS_DECIDE 0x01  /* root-check decision / report path        */
+#define DF_CLASS_EGRESS 0x02  /* kernel -> userspace event egress         */
+#define DF_CLASS_EXPORT 0x04  /* exported, but no caller inside the guard */
+#define DF_CLASS_PRIMARY 0x10 /* short-circuited when enforce mode is on  */
+
+/* The audit target table has to exist before the short-circuit handler that
+ * looks its own entry up by address, so the type and the table come first. */
+struct df_audit {
+    const char *name;
+    unsigned int flags;
+    struct kprobe kp;
+    void *addr;
+    int state;               /* 0 = untried, 1 = armed, -1 = missing, -2 = refused */
+    unsigned int hits;       /* how many times the short-circuit handler ran */
+};
+
+static struct df_audit df_audits[] = {
+    /* name                              flags                                   */
+    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    { "oplus_root_check_pre_handler",    DF_CLASS_DECIDE },
+    { "oplus_root_check_succ",           DF_CLASS_DECIDE },
+    { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
+    { "oplus_root_killed",               DF_CLASS_DECIDE | DF_CLASS_EXPORT },
+    { "oplus_exe_block_ret_handler",     DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    { "oplus_report_execveat",           DF_CLASS_DECIDE },
+    { "oplus_report_execveat_new",       DF_CLASS_DECIDE },
+    { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    { "report_security_event",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
+    { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_PRIMARY },
+};
+#define DF_AUDIT_N ARRAY_SIZE(df_audits)
 
 static struct kprobe defex_enforce_kp;
 static struct kprobe defex_umh_kp;
@@ -46,7 +75,7 @@ static int null_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * reached. Without this the module cannot distinguish "the guard function is
  * not on the path that raises the alert" from "the probe never fired", and the
  * two have completely different fixes. The handler may run from probe context,
- * so it does nothing but a per-CPU-free increment. */
+ * so it does nothing but an increment. */
 static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int i;
@@ -93,56 +122,62 @@ static int df_short_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * Result format written to /dev/dfm0 (also printed to dmesg) is a single line:
  *   ARMED k=v,k=v,...
  * where each value is: M (present, probe registered) / N (symbol missing) /
- * R (present, register_kprobe refused).  bootstrap.c reads this to decide
- * whether the run is allowed to proceed.
+ * R (present, register_kprobe refused), followed by "HITS <name>=<count>" for
+ * every short-circuited target.
  */
-#define DF_CLASS_DECIDE 0x01  /* root-check decision / report path        */
-#define DF_CLASS_EGRESS 0x02  /* kernel -> userspace event egress         */
-#define DF_CLASS_EXPORT 0x04  /* exported, but no caller inside the guard */
-/* Short-circuit only the DF_CLASS_PRIMARY targets when enforce mode is on.
+
+/*
+ * ---------------------------------------------------------------------------
+ * OPD2515 anti-root probe audit
+ * ---------------------------------------------------------------------------
+ * The OPPO guard (oplus_secure_guard_new) detects app-UID -> root transitions
+ * and /data execve targets, then kills the offending task with SIGKILL and
+ * reports a "security event" to userspace through a generic-netlink channel
+ * that SecurityGuard / ExSystemService turn into the visible alert.
  *
- * Device evidence (OPD2515, audit build, logcat 22:38:35) fixed the target set:
+ * A previous revision of this module tried to stop that with
+ *   sh -c "rmmod oplus_secure_guard_new ..."
+ * from the usermode helper below.  That cannot work: the guard is already
+ * initialised before this module gets to run, and the helper's own
+ * root->nobody credential change is itself something the guard watches.
+ *
+ * What this revision does instead is resolve the guard's decision/report
+ * functions by name and register a kprobe on each.  A device audit run on
+ * OPD2515 proved all eleven of them resolve and register (11/11 M), including
+ * the STB_LOCAL ones, because Android 16 GKI is built with CONFIG_KALLSYMS_ALL
+ * and module-local symbols are in kallsyms.
+ *
+ * Enforce mode (the default) then short-circuits only the DF_CLASS_PRIMARY
+ * targets; the remaining targets are registered so a run still reports whether
+ * they are present and probeable, but their function bodies are left alone.
+ *
+ * Why probes are registered by resolved *address* rather than by
+ * .symbol_name: several guard functions are STB_LOCAL, and registering by
+ * symbol name would re-resolve through the module loader instead of using the
+ * address kallsyms already gave us.
+ *
+ * Result format written to /dev/dfm0 (also printed to dmesg) is a single line:
+ *   ARMED k=v,k=v,...
+ * where each value is: M (present, probe registered) / N (symbol missing) /
+ * R (present, register_kprobe refused), followed by a HITS line with the
+ * per-target short-circuit counts.
+ *
+ * Short-circuit set (DF_CLASS_PRIMARY). Device evidence (OPD2515, audit build,
+ * logcat 22:38:35) fixed it:
  *   OPLUS_KEVENT_RECORD event_type=3
  *   payload:10051,path@@/data/app/.../lib/arm64/libdfroot.so
  * i.e. the alert that actually fires is driven by the /data execve path check
  * on our own native library, not by the app-UID root transition. So the primary
  * set spans both paths plus the single netlink egress:
- *   oplus_root_check_post_handler - UID path; its body continues into an
- *                                   inlined send_sig(9) and the kevent report
- *   report_security_event         - shared report primitive on the execve path
- *   oplus_secure_harden_kevent    - the report site observed firing above
- *   oplus_exe_block_ret_handler   - execve-path decision wrapper
- *   kevent_send_to_user           - netlink egress; skips the skb send itself
- *                                   (consumes the sk_buff, hence no re-entry risk
- *                                   from a return-value rewrite)
- * The remaining six targets stay observe-only so a run still reports whether
- * they are present and probeable.
+ *   oplus_root_check_post_handler - UID path; dispatches into
+ *                                   oplus_root_check_succ -> oplus_root_killed
+ *   oplus_exe_block_ret_handler   - execve-path wrapper
+ *   oplus_secure_harden_kevent    - a direct async reporter
+ *   report_security_event         - shared report primitive (11 call sites)
+ *   kevent_send_to_user           - the single netlink egress
+ * The remaining six targets stay observe-only.
  */
-#define DF_CLASS_PRIMARY 0x10
 
-struct df_audit {
-    const char *name;
-    unsigned int flags;
-    struct kprobe kp;
-    void *addr;
-    int state;               /* 0 = untried, 1 = armed, -1 = missing, -2 = refused */
-    unsigned int hits;       /* how many times the short-circuit handler ran */
-};
-
-static struct df_audit df_audits[] = {
-    /* name                              flags                                   */    { "oplus_root_check_post_handler",   DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "oplus_root_check_pre_handler",    DF_CLASS_DECIDE },
-    { "oplus_root_check_succ",           DF_CLASS_DECIDE },
-    { "oplus_root_check_succ_upload",    DF_CLASS_DECIDE },
-    { "oplus_root_killed",               DF_CLASS_DECIDE | DF_CLASS_EXPORT },
-    { "oplus_exe_block_ret_handler",     DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "oplus_report_execveat",           DF_CLASS_DECIDE },
-    { "oplus_report_execveat_new",       DF_CLASS_DECIDE },
-    { "oplus_secure_harden_kevent",      DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "report_security_event",           DF_CLASS_DECIDE | DF_CLASS_PRIMARY },
-    { "kevent_send_to_user",             DF_CLASS_EGRESS | DF_CLASS_PRIMARY },
-};
-#define DF_AUDIT_N ARRAY_SIZE(df_audits)
 
 static int df_audit_ok;
 
