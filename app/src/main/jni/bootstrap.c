@@ -203,46 +203,91 @@ static void publish_audit(void)
 
 /* Root observation bridge, started as a detached daemon.
  *
- * dfroot.ko publishes live probe counters two ways: a kworker appends to
- * /dev/dfm1 (denied by SELinux on this device - kworker context may not write
- * tmpfs), and a misc char device /dev/dfm2 (major 10, minor 221) whose read
- * handler formats the current snapshot in the *reader's* context.  This daemon
- * mknods the device, appends a timestamped snapshot to the app's files dir
- * every 5s, and doubles as a one-shot root command bridge: a command script
- * placed at files/dfcmd (writable via adb run-as df.root) is executed and its
- * output published to files/dfroot-cmdout.txt.  /data/local/tmp is NOT used:
- * this daemon's domain cannot see it.  That is the observation channel this
- * project kept missing - the module itself holds uid 0, so no external grant
- * is needed.
- *
- * The daemon outlives this helper: fork + setsid + exec sh, 720 rounds x 5s. */
+ * dfroot.ko publishes live probe counters on a misc char device /dev/dfm2
+ * (major 10, minor 221) whose read handler formats the current snapshot in the
+ * reader's context.  This daemon (fork + setsid, then a plain C loop - a shell
+ * version was tried first and stalled mid-loop, so every syscall here is
+ * explicit) appends a snapshot to the app's files dir every 5s and doubles as
+ * a one-shot root command bridge: a script placed at files/dfcmd (writable via
+ * adb run-as df.root) is executed and its output published to
+ * files/dfroot-cmdout.txt.  /data/local/tmp is NOT used: this daemon's domain
+ * cannot see it.  That is the observation channel this project kept missing -
+ * the module itself holds uid 0, so no external grant is needed. */
+#define BRIDGE_LIVE    "/data/user_de/0/df.root/files/dfroot-live.txt"
+#define BRIDGE_CMDOUT  "/data/user_de/0/df.root/files/dfroot-cmdout.txt"
+#define BRIDGE_CMDFILE "/data/user_de/0/df.root/files/dfcmd"
+#define BRIDGE_ROUNDS  720
+
+static void bridge_run_cmd(char *cmd)
+{
+    int co = open(BRIDGE_CMDOUT, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    pid_t pid;
+    int status;
+
+    if (co < 0)
+        return;
+    pid = fork();
+    if (pid == 0) {
+        dup2(co, 1);
+        dup2(co, 2);
+        close(co);
+        execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(co);
+    if (pid > 0)
+        waitpid(pid, &status, 0);
+    chmod(BRIDGE_CMDOUT, 0666);
+}
+
+static void bridge_loop(void)
+{
+    static char buf[8192];
+    int i;
+
+    for (i = 0; i < BRIDGE_ROUNDS; i++) {
+        int out = open(BRIDGE_LIVE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+
+        if (out >= 0) {
+            int fd = open("/dev/dfm2", O_RDONLY);
+
+            if (fd >= 0) {
+                ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    if (write(out, buf, (size_t)n) < 0) { /* best effort */ }
+                }
+                close(fd);
+            }
+            close(out);
+        }
+
+        {
+            int cf = open(BRIDGE_CMDFILE, O_RDONLY);
+            if (cf >= 0) {
+                ssize_t n = read(cf, buf, sizeof(buf) - 1);
+                close(cf);
+                unlink(BRIDGE_CMDFILE);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    bridge_run_cmd(buf);
+                }
+            }
+        }
+
+        sleep(5);
+    }
+}
+
 static void start_bridge(void)
 {
-    static const char *script =
-        "OUT=/data/user_de/0/df.root/files/dfroot-live.txt\n"
-        "CMDOUT=/data/user_de/0/df.root/files/dfroot-cmdout.txt\n"
-        "CMDFILE=/data/user_de/0/df.root/files/dfcmd\n"
-        "[ -e /dev/dfm2 ] || mknod /dev/dfm2 c 10 221\n"
-        "chmod 0666 /dev/dfm2 2>/dev/null\n"
-        "i=0\n"
-        "while [ $i -lt 720 ]; do\n"
-        "  echo \"== $(date) ==\" >> $OUT\n"
-        "  cat /dev/dfm2 >> $OUT 2>/dev/null\n"
-        "  if [ -f $CMDFILE ]; then\n"
-        "    { echo \"=== $(date) ===\"; sh $CMDFILE; } > $CMDOUT 2>&1\n"
-        "    chmod 0666 $CMDOUT\n"
-        "    rm -f $CMDFILE\n"
-        "  fi\n"
-        "  sleep 5\n"
-        "  i=$((i+1))\n"
-        "done\n";
-
     pid_t pid = fork();
+
     if (pid != 0)
         return;              /* parent continues; child becomes the daemon */
     setsid();
-    execl("/system/bin/sh", "sh", "-c", script, (char *)NULL);
-    _exit(127);
+    bridge_loop();
+    _exit(0);
 }
 
 static int adopt_zygote_env(void)
