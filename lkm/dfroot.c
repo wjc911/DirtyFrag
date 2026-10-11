@@ -481,7 +481,6 @@ static const struct file_operations df_live_fops = {
     .owner  = THIS_MODULE,
     .open   = nonseekable_open,
     .read   = df_live_read,
-    .llseek = no_llseek,
 };
 
 static struct miscdevice df_live_dev = {
