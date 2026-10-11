@@ -2,12 +2,15 @@
 #include <linux/kernel.h>
 #include <linux/kmod.h>
 #include <linux/kprobes.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/ptrace.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("DFRoot LKM");
@@ -106,6 +109,7 @@ struct df_stackcap {
     unsigned int hits;
     unsigned int nr;
     unsigned long stack[DF_STACK_DEPTH];
+    bool stacked;            /* stack already dumped to the live report */
 };
 
 static struct df_stackcap df_caps[DF_STACK_SLOTS] = {
@@ -350,6 +354,165 @@ static void df_audit_write(const char *msg)
     }
     df_kernel_write(f, msg, strlen(msg), &pos);
     filp_close(f, NULL);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Live report (/dev/dfm1)
+ * ---------------------------------------------------------------------------
+ * The gate report /dev/dfm0 is written exactly once, at module_init, so its
+ * HITS line is by construction an init-time snapshot: nothing has called the
+ * targets yet, and it never changes afterwards.  SELFTEST__printk=11 in that
+ * file is the giveaway - the _printk probe counts every kernel log line on the
+ * system, so a report written even seconds after init would show hundreds, not
+ * the exact number of pr_info calls this module itself made during init.
+ * Treating that frozen file as "probes never fire" is how the previous round
+ * got stuck without ever measuring post-init behaviour.
+ *
+ * /dev/dfm1 is the corrective instrument: a delayed work item appends the live
+ * counters every DF_LIVE_INTERVAL_MS with a T+ timestamp, so the counts can be
+ * aligned against logcat's OPLUS_KEVENT records.  /dev/dfm0 is never touched -
+ * its format is parsed by the bootstrap gate.
+ *
+ * The differential canary separates the remaining hypotheses.  It is a second,
+ * independent kprobe registered on the same __alloc_skb address with its own
+ * counter.  If can grows while the capture probe's hits stay frozen, this
+ * module's probe was selectively removed or disabled; if both freeze while the
+ * self-test keeps growing, kprobes at that address are inert; if all grow, the
+ * probe mechanism is healthy and zero guard-target hits mean the guard does
+ * not reach userspace through the probed symbols.
+ */
+
+#define DF_LIVE_INTERVAL_MS 2000
+#define DF_LIVE_MAX_TICKS   600   /* 20 minutes of post-arming coverage */
+
+static struct delayed_work df_live_work;
+static unsigned int df_live_ticks;
+static s64 df_live_t0_ns;
+static bool df_live_stop;
+
+static struct kprobe df_skb_canary;
+static int df_skb_canary_ok;
+static unsigned int df_skb_canary_hits;
+
+static int df_canary_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    (void)p;
+    (void)regs;
+    df_skb_canary_hits++;
+    return 0;
+}
+
+/* Append-only sibling of df_audit_write: O_APPEND so consecutive snapshots
+ * accumulate instead of clobbering. */
+static void df_live_write(const char *msg)
+{
+    struct file *f;
+    loff_t pos = 0;
+
+    if (!df_filp_open || !df_kernel_write)
+        return;
+    f = df_filp_open("/dev/dfm1", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (IS_ERR(f))
+        return;
+    df_kernel_write(f, msg, strlen(msg), &pos);
+    filp_close(f, NULL);
+}
+
+static void df_live_tick(struct work_struct *w)
+{
+    static char buf[2560];
+    int len = 0;
+    unsigned int i;
+    s64 t_s = (ktime_get_boottime() - df_live_t0_ns) / NSEC_PER_SEC;
+
+    (void)w;
+
+    df_live_ticks++;
+    /* One deliberate printk per tick: the self-test counter must advance by at
+     * least one per line, proving handlers still run long after init. */
+    pr_info("dfroot: live tick n=%u t=+%lld\n", df_live_ticks, t_s);
+
+    if (df_live_ticks == 1) {
+        static char abuf[1792];
+        int alen = 0;
+
+        alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
+                          "LIVE0 bt0=%lld can_ok=%d",
+                          df_live_t0_ns / NSEC_PER_SEC, df_skb_canary_ok);
+        for (i = 0; i < DF_AUDIT_N; i++)
+            if (df_audits[i].addr)
+                alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
+                                  " %s=%px", df_audits[i].name, df_audits[i].addr);
+        for (i = 0; i < DF_CAP_N; i++)
+            if (df_caps[i].addr)
+                alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
+                                  " %s=%px", df_caps[i].name, df_caps[i].addr);
+        alen += scnprintf(abuf + alen, sizeof(abuf) - alen, "\n");
+        df_live_write(abuf);
+    }
+
+    len += scnprintf(buf + len, sizeof(buf) - len,
+                     "LIVE t=+%lld n=%u st=%u can=%u",
+                     t_s, df_live_ticks, df_selftest.hits, df_skb_canary_hits);
+    for (i = 0; i < DF_CAP_N; i++)
+        len += scnprintf(buf + len, sizeof(buf) - len, " %s=%u/%lu",
+                         df_caps[i].name, df_caps[i].hits, df_caps[i].kp.nmissed);
+    for (i = 0; i < DF_AUDIT_N; i++)
+        len += scnprintf(buf + len, sizeof(buf) - len, " %s=%u/%lu",
+                         df_audits[i].name, df_audits[i].hits,
+                         df_audits[i].kp.nmissed);
+    len += scnprintf(buf + len, sizeof(buf) - len, "\n");
+    df_live_write(buf);
+
+    /* Stack lines: the first capture per probe is symbolised inline with %pS,
+     * so the caller that actually reached the primitive is named in the file
+     * itself and needs no offline kallsyms. */
+    for (i = 0; i < DF_CAP_N; i++) {
+        static char sbuf[2048];
+        int slen = 0;
+        unsigned int k;
+
+        if (df_caps[i].nr == 0 || df_caps[i].stacked)
+            continue;
+        df_caps[i].stacked = true;
+        slen += scnprintf(sbuf + slen, sizeof(sbuf) - slen,
+                          "STACK %s t=+%lld:", df_caps[i].name, t_s);
+        for (k = 0; k < df_caps[i].nr; k++)
+            slen += scnprintf(sbuf + slen, sizeof(sbuf) - slen,
+                              " %pS", (void *)df_caps[i].stack[k]);
+        slen += scnprintf(sbuf + slen, sizeof(sbuf) - slen, "\n");
+        df_live_write(sbuf);
+    }
+
+    if (!df_live_stop && df_live_ticks < DF_LIVE_MAX_TICKS)
+        schedule_delayed_work(&df_live_work,
+                              msecs_to_jiffies(DF_LIVE_INTERVAL_MS));
+}
+
+static void df_live_start(void)
+{
+    unsigned int i;
+
+    if (!df_filp_open || !df_kernel_write)
+        return;
+
+    /* Arm the differential canary next to the __alloc_skb capture probe. */
+    for (i = 0; i < DF_CAP_N; i++) {
+        if (df_caps[i].state == 1 && !strcmp(df_caps[i].name, "__alloc_skb")) {
+            memset(&df_skb_canary, 0, sizeof(df_skb_canary));
+            df_skb_canary.addr = (kprobe_opcode_t *)df_caps[i].addr;
+            df_skb_canary.pre_handler = df_canary_pre_handler;
+            df_skb_canary_ok = register_kprobe(&df_skb_canary) == 0;
+            if (!df_skb_canary_ok)
+                pr_warn("dfroot: skb canary refused\n");
+            break;
+        }
+    }
+
+    df_live_t0_ns = ktime_get_boottime();
+    INIT_DELAYED_WORK(&df_live_work, df_live_tick);
+    schedule_delayed_work(&df_live_work, msecs_to_jiffies(DF_LIVE_INTERVAL_MS));
 }
 
 static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
@@ -618,6 +781,10 @@ static int __nocfi __init dfroot_init(void)
     if (!df_audit_ok)
         pr_warn("dfroot: no anti-root guard target resolved; continuing anyway\n");
 
+    // Live counters on /dev/dfm1: the gate report above is a frozen init-time
+    // snapshot, so post-arming probe behaviour is only observable here.
+    df_live_start();
+
     // Run UMH command
     umh_setup = (umh_setup_t)get_addr("call_usermodehelper_setup");
     umh_exec  = (umh_exec_t)get_addr("call_usermodehelper_exec");
@@ -643,6 +810,10 @@ static int __nocfi __init dfroot_init(void)
 
 static void __exit dfroot_exit(void)
 {
+    df_live_stop = true;
+    cancel_delayed_work_sync(&df_live_work);
+    if (df_skb_canary_ok)
+        unregister_kprobe(&df_skb_canary);
     if (defex_enforce_ok) unregister_kprobe(&defex_enforce_kp);
     if (defex_umh_ok)     unregister_kprobe(&defex_umh_kp);
     df_audit_stop();
