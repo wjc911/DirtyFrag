@@ -203,13 +203,17 @@ static void publish_audit(void)
 
 /* Root observation bridge, started as a detached daemon.
  *
- * /dev/dfm1 (dfroot.ko's live probe counters, appended every 2s) has the same
- * problem as /dev/dfm0: kernel-created tmpfs that neither adb shell nor the
- * app's own uid may read under SELinux. This daemon mirrors it into the app's
- * files dir, and doubles as a one-shot root command bridge: anything written to
- * /data/local/tmp/dfcmd by adb is executed and the output published to the app
- * dir. That is the observation channel this project kept missing - the module
- * itself holds uid 0, so no external grant is needed.
+ * dfroot.ko publishes live probe counters two ways: a kworker appends to
+ * /dev/dfm1 (denied by SELinux on this device - kworker context may not write
+ * tmpfs), and a misc char device /dev/dfm2 (major 10, minor 221) whose read
+ * handler formats the current snapshot in the *reader's* context.  This daemon
+ * mknods the device, appends a timestamped snapshot to the app's files dir
+ * every 5s, and doubles as a one-shot root command bridge: a command script
+ * placed at files/dfcmd (writable via adb run-as df.root) is executed and its
+ * output published to files/dfroot-cmdout.txt.  /data/local/tmp is NOT used:
+ * this daemon's domain cannot see it.  That is the observation channel this
+ * project kept missing - the module itself holds uid 0, so no external grant
+ * is needed.
  *
  * The daemon outlives this helper: fork + setsid + exec sh, 720 rounds x 5s. */
 static void start_bridge(void)
@@ -217,15 +221,17 @@ static void start_bridge(void)
     static const char *script =
         "OUT=/data/user_de/0/df.root/files/dfroot-live.txt\n"
         "CMDOUT=/data/user_de/0/df.root/files/dfroot-cmdout.txt\n"
+        "CMDFILE=/data/user_de/0/df.root/files/dfcmd\n"
+        "[ -e /dev/dfm2 ] || mknod /dev/dfm2 c 10 221\n"
+        "chmod 0666 /dev/dfm2 2>/dev/null\n"
         "i=0\n"
         "while [ $i -lt 720 ]; do\n"
-        "  if [ -r /dev/dfm1 ]; then\n"
-        "    cat /dev/dfm1 > $OUT.t 2>/dev/null && mv -f $OUT.t $OUT\n"
-        "  fi\n"
-        "  if [ -f /data/local/tmp/dfcmd ]; then\n"
-        "    { echo \"=== $(date) ===\"; sh /data/local/tmp/dfcmd; } > $CMDOUT 2>&1\n"
+        "  echo \"== $(date) ==\" >> $OUT\n"
+        "  cat /dev/dfm2 >> $OUT 2>/dev/null\n"
+        "  if [ -f $CMDFILE ]; then\n"
+        "    { echo \"=== $(date) ===\"; sh $CMDFILE; } > $CMDOUT 2>&1\n"
         "    chmod 0666 $CMDOUT\n"
-        "    rm -f /data/local/tmp/dfcmd\n"
+        "    rm -f $CMDFILE\n"
         "  fi\n"
         "  sleep 5\n"
         "  i=$((i+1))\n"

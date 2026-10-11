@@ -8,6 +8,7 @@
 #include <linux/ptrace.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/miscdevice.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
@@ -404,7 +405,11 @@ static int df_canary_pre_handler(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* Append-only sibling of df_audit_write: O_APPEND so consecutive snapshots
- * accumulate instead of clobbering. */
+ * accumulate instead of clobbering.  NOTE: this runs from a kworker, and on
+ * this device SELinux (still Enforcing - the selinux_state write does not
+ * take) denies kworker-context writes to tmpfs, so the file stays empty.  It
+ * is kept for kernels where it works; the readable path is the misc device
+ * below, whose read handler runs in the *caller's* context. */
 static void df_live_write(const char *msg)
 {
     struct file *f;
@@ -419,10 +424,77 @@ static void df_live_write(const char *msg)
     filp_close(f, NULL);
 }
 
+/* Format the current snapshot: a LIVE0 line (arming-time addresses) plus a
+ * LIVE line (counters now).  Shared by the work item and the misc read. */
+static int df_live_format(char *buf, size_t size)
+{
+    unsigned int i;
+    int len = 0;
+    s64 t_s = (ktime_get_boottime() - df_live_t0_ns) / NSEC_PER_SEC;
+
+    len += scnprintf(buf + len, size - len, "LIVE0 bt0=%lld can_ok=%d",
+                     df_live_t0_ns / NSEC_PER_SEC, df_skb_canary_ok);
+    for (i = 0; i < DF_AUDIT_N; i++)
+        if (df_audits[i].addr)
+            len += scnprintf(buf + len, size - len,
+                             " %s=%px", df_audits[i].name, df_audits[i].addr);
+    for (i = 0; i < DF_CAP_N; i++)
+        if (df_caps[i].addr)
+            len += scnprintf(buf + len, size - len,
+                             " %s=%px", df_caps[i].name, df_caps[i].addr);
+    len += scnprintf(buf + len, size - len, "\n");
+
+    len += scnprintf(buf + len, size - len,
+                     "LIVE t=+%lld n=%u st=%u can=%u",
+                     t_s, df_live_ticks, df_selftest.hits, df_skb_canary_hits);
+    for (i = 0; i < DF_CAP_N; i++)
+        len += scnprintf(buf + len, size - len, " %s=%u/%lu",
+                         df_caps[i].name, df_caps[i].hits, df_caps[i].kp.nmissed);
+    for (i = 0; i < DF_AUDIT_N; i++)
+        len += scnprintf(buf + len, size - len, " %s=%u/%lu",
+                         df_audits[i].name, df_audits[i].hits,
+                         df_audits[i].kp.nmissed);
+    len += scnprintf(buf + len, size - len, "\n");
+    return len;
+}
+
+/* Misc device /dev/dfm2 (major 10, minor 221): every read returns the current
+ * snapshot.  The file op runs in the reader's process context, so whoever may
+ * read the node at all gets live data - unlike the kworker file write above,
+ * which this device's SELinux policy denies. */
+static ssize_t df_live_read(struct file *f, char __user *ubuf, size_t cnt, loff_t *ppos)
+{
+    static char buf[2560];
+    ssize_t len, ret;
+
+    if (*ppos > 0 || !cnt)
+        return 0;
+    len = df_live_format(buf, sizeof(buf));
+    ret = (ssize_t)len < (ssize_t)cnt ? len : (ssize_t)cnt;
+    if (copy_to_user(ubuf, buf, ret))
+        return -EFAULT;
+    *ppos = ret;
+    return ret;
+}
+
+static const struct file_operations df_live_fops = {
+    .owner  = THIS_MODULE,
+    .open   = nonseekable_open,
+    .read   = df_live_read,
+    .llseek = no_llseek,
+};
+
+static struct miscdevice df_live_dev = {
+    .minor = 221,           /* fixed so the bridge can mknod without dmesg */
+    .name  = "dfm2",
+    .fops  = &df_live_fops,
+    .mode  = 0666,
+};
+static int df_live_misc_ok;
+
 static void df_live_tick(struct work_struct *w)
 {
     static char buf[2560];
-    int len = 0;
     unsigned int i;
     s64 t_s = (ktime_get_boottime() - df_live_t0_ns) / NSEC_PER_SEC;
 
@@ -430,39 +502,10 @@ static void df_live_tick(struct work_struct *w)
 
     df_live_ticks++;
     /* One deliberate printk per tick: the self-test counter must advance by at
-     * least one per line, proving handlers still run long after init. */
+     * least one per snapshot, proving handlers still run long after init. */
     pr_info("dfroot: live tick n=%u t=+%lld\n", df_live_ticks, t_s);
 
-    if (df_live_ticks == 1) {
-        static char abuf[1792];
-        int alen = 0;
-
-        alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
-                          "LIVE0 bt0=%lld can_ok=%d",
-                          df_live_t0_ns / NSEC_PER_SEC, df_skb_canary_ok);
-        for (i = 0; i < DF_AUDIT_N; i++)
-            if (df_audits[i].addr)
-                alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
-                                  " %s=%px", df_audits[i].name, df_audits[i].addr);
-        for (i = 0; i < DF_CAP_N; i++)
-            if (df_caps[i].addr)
-                alen += scnprintf(abuf + alen, sizeof(abuf) - alen,
-                                  " %s=%px", df_caps[i].name, df_caps[i].addr);
-        alen += scnprintf(abuf + alen, sizeof(abuf) - alen, "\n");
-        df_live_write(abuf);
-    }
-
-    len += scnprintf(buf + len, sizeof(buf) - len,
-                     "LIVE t=+%lld n=%u st=%u can=%u",
-                     t_s, df_live_ticks, df_selftest.hits, df_skb_canary_hits);
-    for (i = 0; i < DF_CAP_N; i++)
-        len += scnprintf(buf + len, sizeof(buf) - len, " %s=%u/%lu",
-                         df_caps[i].name, df_caps[i].hits, df_caps[i].kp.nmissed);
-    for (i = 0; i < DF_AUDIT_N; i++)
-        len += scnprintf(buf + len, sizeof(buf) - len, " %s=%u/%lu",
-                         df_audits[i].name, df_audits[i].hits,
-                         df_audits[i].kp.nmissed);
-    len += scnprintf(buf + len, sizeof(buf) - len, "\n");
+    df_live_format(buf, sizeof(buf));
     df_live_write(buf);
 
     /* Stack lines: the first capture per probe is symbolised inline with %pS,
@@ -494,9 +537,6 @@ static void df_live_start(void)
 {
     unsigned int i;
 
-    if (!df_filp_open || !df_kernel_write)
-        return;
-
     /* Arm the differential canary next to the __alloc_skb capture probe. */
     for (i = 0; i < DF_CAP_N; i++) {
         if (df_caps[i].state == 1 && !strcmp(df_caps[i].name, "__alloc_skb")) {
@@ -513,6 +553,10 @@ static void df_live_start(void)
     df_live_t0_ns = ktime_get_boottime();
     INIT_DELAYED_WORK(&df_live_work, df_live_tick);
     schedule_delayed_work(&df_live_work, msecs_to_jiffies(DF_LIVE_INTERVAL_MS));
+
+    df_live_misc_ok = misc_register(&df_live_dev) == 0;
+    if (!df_live_misc_ok)
+        pr_warn("dfroot: misc dfm2 registration failed\n");
 }
 
 static int __init df_audit_run(kallsyms_lookup_name_t get_addr)
@@ -812,6 +856,8 @@ static void __exit dfroot_exit(void)
 {
     df_live_stop = true;
     cancel_delayed_work_sync(&df_live_work);
+    if (df_live_misc_ok)
+        misc_deregister(&df_live_dev);
     if (df_skb_canary_ok)
         unregister_kprobe(&df_skb_canary);
     if (defex_enforce_ok) unregister_kprobe(&defex_enforce_kp);
